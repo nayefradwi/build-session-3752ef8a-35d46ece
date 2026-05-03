@@ -5,6 +5,7 @@ import { z } from "zod";
 import { db } from "@/lib/db";
 import { columns, projects, teamMemberships } from "@/lib/db/schema";
 import { auth } from "@/lib/server/auth";
+import { recalculatePositions } from "@/lib/server/position";
 import { resolveProjectAccessByProjectId } from "@/lib/server/projects/access";
 
 // Forced dynamic: every call mutates state, is gated by the session cookie,
@@ -255,18 +256,26 @@ export async function PATCH(
         .set({ position: sql`-(${columns.position} + 1)` })
         .where(eq(columns.projectId, access.project.id));
 
-      // Phase 2: stamp each column at its target index. We re-assert the
-      // column→project relationship in the WHERE clause as defense-in-depth
-      // — the set-equality check above already guarantees the id is in this
-      // project, but the extra predicate prevents a stale id from a
-      // concurrent (now-failed) cascade-delete from accidentally landing.
-      for (let i = 0; i < orderedColumnIds.length; i++) {
+      // Phase 2: stamp each column at its target slot. Positions follow
+      // the canonical POSITION_STEP (1000) spacing produced by the
+      // shared `recalculatePositions` helper — `index * 1000` rather
+      // than the bare index — so subsequent mid-inserts (a column drag
+      // landing between two siblings) have headroom without forcing
+      // another re-stamp. We re-assert the column→project relationship
+      // in the WHERE clause as defense-in-depth: the set-equality check
+      // above already guarantees the id is in this project, but the
+      // extra predicate prevents a stale id from a concurrent
+      // (now-failed) cascade-delete from accidentally landing.
+      const stamped = recalculatePositions(
+        orderedColumnIds.map((id) => ({ id, position: 0 })),
+      );
+      for (const row of stamped) {
         await tx
           .update(columns)
-          .set({ position: i })
+          .set({ position: row.position })
           .where(
             and(
-              eq(columns.id, orderedColumnIds[i]),
+              eq(columns.id, row.id),
               eq(columns.projectId, access.project.id),
             ),
           );

@@ -5,6 +5,7 @@ import { z } from "zod";
 import { db } from "@/lib/db";
 import { columns, tasks, teamMemberships, users } from "@/lib/db/schema";
 import { auth } from "@/lib/server/auth";
+import { getNewPosition } from "@/lib/server/position";
 import { resolveProjectAccessByProjectId } from "@/lib/server/projects/access";
 
 // Forced dynamic: every read pulls the session cookie and queries the DB,
@@ -345,17 +346,22 @@ export async function POST(
         return { kind: "bad_column" as const };
       }
 
+      // Pull existing tasks pre-sorted by ascending position so the
+      // shared `getNewPosition` helper can derive the append slot
+      // directly from `existing[length - 1]`. Append uses the standard
+      // POSITION_STEP (1000) spacing which leaves room for ~10 mid-
+      // inserts between adjacent cards before a recalculation is
+      // required — see `lib/server/position.ts` for the contract.
       const existing = await tx
         .select({ position: tasks.position })
         .from(tasks)
-        .where(eq(tasks.columnId, column.id));
+        .where(eq(tasks.columnId, column.id))
+        .orderBy(asc(tasks.position));
 
-      // Empty column bootstraps at 0; otherwise append after the current
-      // max so existing positions stay stable for any open board UIs.
-      const nextPosition =
-        existing.length === 0
-          ? 0
-          : Math.max(...existing.map((row) => row.position)) + 1;
+      // `insertAfterIndex = existing.length - 1` is the canonical
+      // "append" call; the helper short-circuits to 0 when the column
+      // is empty (length-0 case) so no extra branch is needed here.
+      const nextPosition = getNewPosition(existing, existing.length - 1);
 
       const [created] = await tx
         .insert(tasks)

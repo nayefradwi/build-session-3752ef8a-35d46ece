@@ -5,6 +5,7 @@ import { z } from "zod";
 import { db } from "@/lib/db";
 import { columns, projects, teamMemberships } from "@/lib/db/schema";
 import { auth } from "@/lib/server/auth";
+import { getNewPosition } from "@/lib/server/position";
 import { resolveProjectAccessByProjectId } from "@/lib/server/projects/access";
 
 // Forced dynamic: every read pulls the session cookie and queries the DB,
@@ -251,21 +252,26 @@ export async function POST(
         .where(eq(projects.id, access.project.id))
         .for("update");
 
+      // Pull existing columns pre-sorted by ascending position so the
+      // shared `getNewPosition` helper can derive the append slot from
+      // `existing[length - 1]`. Append uses the standard POSITION_STEP
+      // (1000) spacing — see `lib/server/position.ts` for the contract.
       const existing = await tx
         .select({ position: columns.position })
         .from(columns)
-        .where(eq(columns.projectId, access.project.id));
+        .where(eq(columns.projectId, access.project.id))
+        .orderBy(asc(columns.position));
 
       if (existing.length >= MAX_COLUMNS_PER_PROJECT) {
         return { kind: "limit" as const };
       }
 
-      // No-columns case bootstraps the lane order at 0; otherwise we append
-      // after the current max so existing positions are never disturbed.
-      const nextPosition =
-        existing.length === 0
-          ? 0
-          : Math.max(...existing.map((row) => row.position)) + 1;
+      // `insertAfterIndex = existing.length - 1` is the canonical
+      // "append" call; the helper short-circuits to 0 when the project
+      // has no columns yet, so no extra branch is needed here. The
+      // (projectId, position) unique index acts as a backstop for
+      // races, but the FOR UPDATE row lock above already serializes us.
+      const nextPosition = getNewPosition(existing, existing.length - 1);
 
       const [created] = await tx
         .insert(columns)
