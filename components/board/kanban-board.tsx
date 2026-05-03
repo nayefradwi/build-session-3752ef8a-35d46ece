@@ -20,6 +20,7 @@ import {
 import {
   AlertCircle,
   ArrowLeft,
+  Eye,
   KanbanSquare,
   Layers,
   Lock,
@@ -130,6 +131,28 @@ type TeamDetailResponse = {
 
 type KanbanBoardProps = {
   teamId: string;
+  /**
+   * When true, force the board into a non-interactive, read-only mode:
+   *
+   *   - Drag-and-drop gestures (task move, column reorder) are disabled.
+   *   - Write affordances ("Add column", "+ Add task", inline rename pencil,
+   *     column delete trash, per-task Edit/Delete) are hidden across the
+   *     surface.
+   *   - A read-only banner is rendered above the board chrome to make the
+   *     state explicit, since otherwise the missing affordances would just
+   *     read as a normal-looking but quietly-disabled board.
+   *
+   * The board ALSO derives an effective read-only state internally whenever
+   * the project resolves with `isMember=false` — that's how a tenant member
+   * lands on a board for a public project owned by a team they don't belong
+   * to. Both paths converge on the same banner + gating, so the prop is
+   * purely a way for a caller to force the read-only experience even when
+   * the caller IS a member (e.g. a future preview mode); the default
+   * behavior is unchanged for existing call sites that omit the prop.
+   *
+   * @default false
+   */
+  readOnly?: boolean;
 };
 
 /**
@@ -163,7 +186,7 @@ type KanbanBoardProps = {
  *     breakpoint would make the board feel completely different on mobile.
  *     Lanes shrink to ~256px to keep one fully visible.
  */
-export function KanbanBoard({ teamId }: KanbanBoardProps) {
+export function KanbanBoard({ teamId, readOnly = false }: KanbanBoardProps) {
   const { data: session, status: sessionStatus } = useSession();
   const callerId = session?.user?.id ?? null;
 
@@ -460,6 +483,16 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
     return columns.find((c) => c.id === addTaskColumnId) ?? null;
   }, [addTaskColumnId, columns]);
 
+  // Effective read-only state. Caller can force read-only via the prop; we
+  // ALSO derive read-only when the project resolves with `isMember=false`
+  // (the public-project visitor path), which is the spec's primary trigger:
+  // "pass readOnly=true when viewing a public project where isMember=false".
+  // We require `project` to be resolved before flipping the implicit branch
+  // so we don't briefly paint a read-only banner while the membership fetch
+  // is still in flight — during loading the existing skeleton state covers
+  // the surface and `isMember` is still its initial `false`.
+  const effectiveReadOnly = readOnly || (project !== null && !isMember);
+
   /* --------------------------- Drag-and-drop ---------------------------- */
 
   // Active task being dragged — drives the `DragOverlay` clone. We snapshot
@@ -503,6 +536,13 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
 
   const handleDragStart = useCallback(
     (event: DragStartEvent) => {
+      // Read-only short-circuit. The per-card / per-column dnd-kit hooks
+      // already disable themselves when their `canReorder*` flags are
+      // false, so under normal conditions we'd never see a drag-start
+      // event here — but a forced read-only override could land between a
+      // pointerdown and the activation distance threshold, so we bail
+      // defensively rather than rely solely on the upstream gate.
+      if (effectiveReadOnly) return;
       const data = event.active.data.current as
         | { type?: string; task?: BoardTask; columnId?: string }
         | undefined;
@@ -519,7 +559,7 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
         columnRollbackSnapshotRef.current = columns;
       }
     },
-    [columns],
+    [columns, effectiveReadOnly],
   );
 
   const handleDragCancel = useCallback(() => {
@@ -674,6 +714,18 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
 
   const handleDragEnd = useCallback(
     (event: DragEndEvent) => {
+      // Read-only short-circuit. Mirrors `handleDragStart` — the per-item
+      // dnd-kit hooks should keep us out of here, but we defend against a
+      // race where the read-only flag flips mid-drag (e.g. a forced
+      // override from a parent) by clearing both rollback snapshots and
+      // both overlay clones without persisting anything.
+      if (effectiveReadOnly) {
+        setActiveTask(null);
+        setActiveColumn(null);
+        rollbackSnapshotRef.current = null;
+        columnRollbackSnapshotRef.current = null;
+        return;
+      }
       const { active, over } = event;
       const activeData = active.data.current as
         | {
@@ -872,7 +924,7 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
       setColumns(next);
       void persistMove(activeId, targetColumnId, newPosition, snapshot);
     },
-    [persistMove, persistColumnReorder, project],
+    [effectiveReadOnly, persistMove, persistColumnReorder, project],
   );
 
   /* ------------------------------- Render -------------------------------- */
@@ -912,6 +964,7 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
           project={project}
           isMember={isMember}
           isTeamAdmin={isTeamAdmin}
+          readOnly={effectiveReadOnly}
           columns={columns}
           loading={loading}
           onRefresh={() => void loadBoard()}
@@ -943,9 +996,12 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
         </DragOverlay>
       </DndContext>
       {/* Mounted only when we know the projectId AND the caller is a team
-          admin — the dialog needs the projectId to POST against, and the
-          server will 403 a non-admin's submission anyway. */}
-      {isTeamAdmin && project ? (
+          admin AND the board isn't read-only. The dialog needs the projectId
+          to POST against, and the server will 403 a non-admin's submission
+          anyway; the read-only gate matches the hidden trigger affordance so
+          the dialog can never open in a read-only context (no trigger ever
+          renders). */}
+      {isTeamAdmin && project && !effectiveReadOnly ? (
         <AddColumnDialog
           open={addColumnOpen}
           onOpenChange={setAddColumnOpen}
@@ -953,12 +1009,12 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
           onCreated={handleColumnCreated}
         />
       ) : null}
-      {/* Mounted whenever the caller is a team member AND the project has
-          resolved — non-members would 403 on submit, and the dialog needs
-          the projectId in its POST. We unmount on dialog-close (rather than
-          hide) so transient form state resets cleanly without a custom
-          effect. */}
-      {isMember && project && addTaskColumn ? (
+      {/* Mounted whenever the caller is a team member, the project has
+          resolved, AND the board isn't read-only. Non-members would 403 on
+          submit, and the dialog needs the projectId in its POST. We unmount
+          on dialog-close (rather than hide) so transient form state resets
+          cleanly without a custom effect. */}
+      {isMember && project && addTaskColumn && !effectiveReadOnly ? (
         <AddTaskDialog
           open={Boolean(addTaskColumn)}
           onOpenChange={(next) => {
@@ -989,7 +1045,11 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
           if (!next) setDetailTaskId(null);
         }}
         taskId={detailTaskId}
-        canEdit={isMember}
+        // Edit + Delete affordances inside the modal are gated on team
+        // membership AND the board's read-only state. A read-only board
+        // hides every other write affordance for consistency, so the modal
+        // should likewise present a view-only surface to the visitor.
+        canEdit={isMember && !effectiveReadOnly}
         members={teamMembers}
         teamId={teamId}
         onUpdated={handleTaskUpdated}
@@ -1008,6 +1068,12 @@ type BoardLayoutProps = {
   project: Project | null;
   isMember: boolean;
   isTeamAdmin: boolean;
+  /**
+   * Effective read-only flag — already merges the explicit `readOnly` prop
+   * with the implicit "public project + non-member" path. When true, every
+   * write affordance is hidden and a banner is rendered above the header.
+   */
+  readOnly: boolean;
   columns: BoardColumnData[];
   loading: boolean;
   onRefresh: () => void;
@@ -1028,6 +1094,7 @@ function BoardLayout({
   project,
   isMember,
   isTeamAdmin,
+  readOnly,
   columns,
   loading,
   onRefresh,
@@ -1039,8 +1106,10 @@ function BoardLayout({
 }: BoardLayoutProps) {
   // The drag-to-reorder gesture mirrors the server-side member check on
   // PATCH /api/tasks/[taskId]/move. Visitors of a public project can still
-  // click cards open, but the gesture stays hidden for them.
-  const canReorder = isMember;
+  // click cards open, but the gesture stays hidden for them. Read-only
+  // mode is an additional override so a forced read-only board never
+  // surfaces the gesture even for a logged-in member.
+  const canReorder = isMember && !readOnly;
   const totalTasks = useMemo(
     () => columns.reduce((sum, col) => sum + col.tasks.length, 0),
     [columns],
@@ -1048,6 +1117,12 @@ function BoardLayout({
 
   return (
     <div className="space-y-6">
+      {/* Read-only banner. Rendered above the header so the explanation lands
+          before the user starts hunting for missing affordances. The banner
+          mirrors what `effectiveReadOnly` is gating below; once a member is
+          added to the team (or the read-only override flips back) it
+          disappears alongside the now-restored write controls. */}
+      {readOnly ? <ReadOnlyBanner project={project} /> : null}
       <header className="space-y-3">
         <Button asChild variant="ghost" size="sm" className="-ml-3">
           <Link href={`/teams/${teamId}/members`}>
@@ -1097,6 +1172,7 @@ function BoardLayout({
         projectId={project?.id ?? null}
         isMember={isMember}
         isTeamAdmin={isTeamAdmin}
+        readOnly={readOnly}
         onRequestAddColumn={onRequestAddColumn}
         onRequestAddTask={onRequestAddTask}
         onSelectTask={onSelectTask}
@@ -1122,6 +1198,13 @@ type BoardColumnsProps = {
   projectId: string | null;
   isMember: boolean;
   isTeamAdmin: boolean;
+  /**
+   * When true, every write affordance (Add column, +Add task, inline rename,
+   * column delete) is hidden and column-reorder DnD is disabled. Combined
+   * with the existing `isMember` / `isTeamAdmin` gates so a non-admin member
+   * still doesn't see admin-only chrome on a non-read-only board.
+   */
+  readOnly: boolean;
   onRequestAddColumn: () => void;
   onRequestAddTask: (columnId: string) => void;
   onSelectTask: (task: BoardTask) => void;
@@ -1146,6 +1229,7 @@ function BoardColumns({
   projectId,
   isMember,
   isTeamAdmin,
+  readOnly,
   onRequestAddColumn,
   onRequestAddTask,
   onSelectTask,
@@ -1165,6 +1249,7 @@ function BoardColumns({
       <BoardEmptyState
         isMember={isMember}
         isTeamAdmin={isTeamAdmin}
+        readOnly={readOnly}
         onRequestAddColumn={onRequestAddColumn}
       />
     );
@@ -1174,8 +1259,9 @@ function BoardColumns({
   // We hide the trigger past the cap so the affordance doesn't lure the
   // admin into a guaranteed 422 — the server is still authoritative on the
   // limit (concurrent inserts could push us over the threshold between
-  // renders), but this keeps the happy-path UI clean.
-  const canAddColumn = isTeamAdmin && columns.length < 10;
+  // renders), but this keeps the happy-path UI clean. Read-only mode forces
+  // the affordance off regardless of admin status.
+  const canAddColumn = isTeamAdmin && !readOnly && columns.length < 10;
 
   // Min-columns invariant for the per-column delete affordance: a project
   // must always have at least one column (server returns 422 LAST_COLUMN
@@ -1213,14 +1299,16 @@ function BoardColumns({
               // Column drag-reorder gate mirrors the server-side team-admin
               // check on PATCH /api/projects/[projectId]/columns/reorder.
               // Tenant admins do NOT bypass; column management is team-
-              // scoped, just like inline rename. Disabled for non-admins so
-              // the SortableContext above stays a no-op for them.
-              canReorderColumns={isTeamAdmin}
+              // scoped, just like inline rename. Read-only mode forces the
+              // gesture off so the SortableContext above stays a no-op for
+              // every column when the board is locked down.
+              canReorderColumns={isTeamAdmin && !readOnly}
               // Team-member gate: only members can append tasks (the server
-              // 403s non-members regardless of project visibility). Hiding the
-              // affordance keeps the read-only experience clean for visitors
-              // on a public project.
-              canAddTask={isMember}
+              // 403s non-members regardless of project visibility). Hiding
+              // the affordance keeps the read-only experience clean for
+              // visitors on a public project AND for forced read-only
+              // overrides.
+              canAddTask={isMember && !readOnly}
               onRequestAddTask={() => onRequestAddTask(column.id)}
               // Click on any card in this lane opens the shared task-detail
               // modal mounted by the parent KanbanBoard. Visitors of a public
@@ -1229,12 +1317,14 @@ function BoardColumns({
               onSelectTask={onSelectTask}
               // Task drag-to-reorder is gated on the same team-member rule
               // as task creation, since the task-move endpoint enforces the
-              // check server-side anyway.
+              // check server-side anyway. The parent already folds the
+              // read-only flag into `canReorder`.
               canReorder={canReorder}
               // Inline rename gate mirrors the server-side team-admin check
               // on PUT /api/projects/[projectId]/columns/[columnId]. Tenant
               // admins do NOT bypass; column management is team-scoped.
-              canEditName={isTeamAdmin}
+              // Read-only mode hides the pencil affordance.
+              canEditName={isTeamAdmin && !readOnly}
               projectId={projectId ?? undefined}
               onRenamed={onColumnRenamed}
               // Delete affordance is admin-only — same gate as rename, and
@@ -1243,7 +1333,8 @@ function BoardColumns({
               // column remains so the admin understands *why* they can't
               // delete; the server returns 422 LAST_COLUMN as a backstop
               // for the racing-peer case where columns.length is stale.
-              canDelete={isTeamAdmin}
+              // Read-only mode hides the trash icon entirely.
+              canDelete={isTeamAdmin && !readOnly}
               disableDelete={onlyOneColumn}
               onDeleted={onColumnDeleted}
             />
@@ -1290,18 +1381,84 @@ function AddColumnTrigger({ onClick }: { onClick: () => void }) {
 }
 
 /* -------------------------------------------------------------------------- */
+/*                            Read-only banner                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Read-only banner pinned above the board header.
+ *
+ *   - Renders only when `effectiveReadOnly` is true (the parent already does
+ *     the gating; this component assumes it's mounted intentionally).
+ *   - Copy distinguishes the two read-only triggers when possible:
+ *       * If we know the project's visibility AND it's `public`, we surface
+ *         the "you're viewing a public board" framing, since that's how a
+ *         non-member ends up here in the first place — it answers the
+ *         visitor's implicit "why am I locked out?" question without an
+ *         extra click.
+ *       * Otherwise (project still loading, or a forced read-only override),
+ *         we fall back to a generic "view-only" message so the banner is
+ *         never empty.
+ *   - Styled as an accent-colored notice (border + tinted background +
+ *     icon) so it reads as informational, not error-state. We avoid the
+ *     `destructive` palette deliberately — read-only isn't a failure mode,
+ *     it's the expected experience for non-members on a public board.
+ *   - `role="status"` (rather than `role="alert"`) so screen readers
+ *     announce it as a polite status update rather than interrupting the
+ *     user's flow.
+ */
+function ReadOnlyBanner({ project }: { project: Project | null }) {
+  const isPublicVisitor = project?.visibility === "public";
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="flex items-start gap-3 rounded-md border border-sky-500/40 bg-sky-500/10 px-4 py-3 text-sm text-sky-900 dark:text-sky-100"
+    >
+      <Eye
+        className="mt-0.5 h-4 w-4 shrink-0 text-sky-600 dark:text-sky-300"
+        aria-hidden="true"
+      />
+      <div className="space-y-0.5">
+        <p className="font-medium">
+          {isPublicVisitor ? "Viewing a public board" : "View-only board"}
+        </p>
+        <p className="text-sky-900/80 dark:text-sky-100/80">
+          {isPublicVisitor
+            ? "You're not a member of this team, so you can browse but can't edit. Ask a team admin to add you to make changes."
+            : "You can browse this board but can't make changes. Editing is reserved for team members."}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
 /*                              Empty state                                   */
 /* -------------------------------------------------------------------------- */
 
 function BoardEmptyState({
   isMember,
   isTeamAdmin,
+  readOnly,
   onRequestAddColumn,
 }: {
   isMember: boolean;
   isTeamAdmin: boolean;
+  readOnly: boolean;
   onRequestAddColumn: () => void;
 }) {
+  // Read-only short-circuit: in read-only mode we never render the "Add
+  // column" CTA regardless of admin status, so the copy collapses to the
+  // visitor-shaped message. We still render the same dashed-card frame
+  // so the layout stays consistent across membership transitions.
+  const showAddColumn = isTeamAdmin && !readOnly;
+  const helpText = readOnly
+    ? "This board doesn't have any columns yet. Check back once the team has set things up."
+    : isTeamAdmin
+      ? "Add the first column to start organizing this board."
+      : isMember
+        ? "A team admin can add columns to start organizing this board."
+        : "This board doesn't have any columns yet. Check back once the team has set things up.";
   return (
     <div
       className="rounded-lg border border-dashed bg-background px-6 py-12 text-center"
@@ -1313,13 +1470,9 @@ function BoardEmptyState({
       />
       <p className="mt-3 text-base font-medium">No columns yet</p>
       <p className="mx-auto mt-1 max-w-md text-sm text-muted-foreground">
-        {isTeamAdmin
-          ? "Add the first column to start organizing this board."
-          : isMember
-            ? "A team admin can add columns to start organizing this board."
-            : "This board doesn't have any columns yet. Check back once the team has set things up."}
+        {helpText}
       </p>
-      {isTeamAdmin ? (
+      {showAddColumn ? (
         <div className="mt-4 flex justify-center">
           <Button type="button" onClick={onRequestAddColumn}>
             <Plus className="h-4 w-4" aria-hidden="true" />
