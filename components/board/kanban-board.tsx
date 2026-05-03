@@ -22,6 +22,7 @@ import {
   AddTaskDialog,
   type AddTaskTeamMember,
 } from "@/components/board/add-task-dialog";
+import { TaskDetailModal } from "@/components/board/task-detail-modal";
 import type { BoardColumnData, BoardTask } from "@/components/board/types";
 
 /* -------------------------------------------------------------------------- */
@@ -152,6 +153,11 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
   // keeps a single dialog instance mounted at a time so opening a different
   // lane's "+ Add task" cleanly swaps the target without remounting.
   const [addTaskColumnId, setAddTaskColumnId] = useState<string | null>(null);
+  // Task currently being inspected via the detail modal. Lifting to the
+  // board (rather than per-card or per-column) means a single modal
+  // instance handles every card on the board, and Radix can run its
+  // open→close animation cleanly when swapping between cards.
+  const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -367,6 +373,7 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
         onRefresh={() => void loadBoard()}
         onRequestAddColumn={() => setAddColumnOpen(true)}
         onRequestAddTask={(columnId) => setAddTaskColumnId(columnId)}
+        onSelectTask={(task) => setDetailTaskId(task.id)}
       />
       {/* Mounted only when we know the projectId AND the caller is a team
           admin — the dialog needs the projectId to POST against, and the
@@ -397,6 +404,18 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
           onCreated={handleTaskCreated}
         />
       ) : null}
+      {/* Task detail modal — single shared instance. We mount it
+          unconditionally (the modal itself no-ops when `taskId` is null
+          AND it isn't open) so opening a card animates in cleanly without
+          a fresh mount. The modal re-fetches `GET /api/tasks/[taskId]`
+          every time it opens, which is cheap and keeps the surface fresh. */}
+      <TaskDetailModal
+        open={detailTaskId !== null}
+        onOpenChange={(next) => {
+          if (!next) setDetailTaskId(null);
+        }}
+        taskId={detailTaskId}
+      />
     </>
   );
 }
@@ -415,6 +434,7 @@ type BoardLayoutProps = {
   onRefresh: () => void;
   onRequestAddColumn: () => void;
   onRequestAddTask: (columnId: string) => void;
+  onSelectTask: (task: BoardTask) => void;
 };
 
 function BoardLayout({
@@ -427,6 +447,7 @@ function BoardLayout({
   onRefresh,
   onRequestAddColumn,
   onRequestAddTask,
+  onSelectTask,
 }: BoardLayoutProps) {
   const totalTasks = useMemo(
     () => columns.reduce((sum, col) => sum + col.tasks.length, 0),
@@ -485,6 +506,7 @@ function BoardLayout({
         isTeamAdmin={isTeamAdmin}
         onRequestAddColumn={onRequestAddColumn}
         onRequestAddTask={onRequestAddTask}
+        onSelectTask={onSelectTask}
       />
     </div>
   );
@@ -500,6 +522,7 @@ type BoardColumnsProps = {
   isTeamAdmin: boolean;
   onRequestAddColumn: () => void;
   onRequestAddTask: (columnId: string) => void;
+  onSelectTask: (task: BoardTask) => void;
 };
 
 function BoardColumns({
@@ -508,6 +531,7 @@ function BoardColumns({
   isTeamAdmin,
   onRequestAddColumn,
   onRequestAddTask,
+  onSelectTask,
 }: BoardColumnsProps) {
   if (columns.length === 0) {
     return (
@@ -548,6 +572,11 @@ function BoardColumns({
             // on a public project.
             canAddTask={isMember}
             onRequestAddTask={() => onRequestAddTask(column.id)}
+            // Click on any card in this lane opens the shared task-detail
+            // modal mounted by the parent KanbanBoard. Visitors of a public
+            // project (non-members) still get this — the GET endpoint only
+            // requires tenant + project visibility, not membership.
+            onSelectTask={onSelectTask}
           />
         ))}
         {canAddColumn ? (

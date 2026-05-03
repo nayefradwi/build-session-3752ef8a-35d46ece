@@ -1,5 +1,6 @@
 "use client";
 
+import { cn } from "@/lib/client/utils";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Card } from "@/components/ui/card";
 import type { BoardTask, BoardTaskAssignee } from "@/components/board/types";
@@ -30,6 +31,14 @@ const initialsFromAssignee = (assignee: BoardTaskAssignee): string => {
 
 type BoardTaskCardProps = {
   task: BoardTask;
+  /**
+   * Optional click handler. When provided the card becomes a button-shaped
+   * affordance (focusable, keyboard-activatable) so the parent can open a
+   * task-detail surface — typically the {@link import("./task-detail-modal").TaskDetailModal}.
+   * When omitted the card stays a plain, non-interactive surface (the
+   * skeleton/placeholder paths use this).
+   */
+  onSelect?: (task: BoardTask) => void;
 };
 
 /**
@@ -44,14 +53,25 @@ type BoardTaskCardProps = {
  *     avatar carries the full name/email as a tooltip via `title` so a hover
  *     surfaces the full identity without needing a popover.
  *
- * The card is a plain surface today — no click handler, no drag handle. The
- * outer `<li>` makes it landmark-addressable in the column list, and we
- * keep the markup hook-free so a follow-up can layer task-detail navigation
- * (e.g. wrap in `<Link href={`/tasks/${task.id}`}>`) without restructuring.
+ * Interaction:
+ *   - When `onSelect` is provided the entire card is a `role="button"`
+ *     element (we use a real `<button>` so Enter/Space activation comes for
+ *     free), and clicking/keyboard-activating the card hands the task back
+ *     to the parent — typically to open the task-detail modal.
+ *   - When `onSelect` is omitted the card stays a plain `<div>` so callsites
+ *     that render skeleton/preview cards don't get the focus ring.
  */
-export function BoardTaskCard({ task }: BoardTaskCardProps) {
-  return (
-    <Card className="space-y-2 rounded-md border bg-background p-3 shadow-sm transition-colors hover:border-foreground/30 hover:shadow-md">
+export function BoardTaskCard({ task, onSelect }: BoardTaskCardProps) {
+  const interactive = typeof onSelect === "function";
+  const cardClassName = cn(
+    "block w-full space-y-2 rounded-md border bg-background p-3 text-left shadow-sm transition-colors",
+    "hover:border-foreground/30 hover:shadow-md",
+    interactive &&
+      "cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ring-offset-background",
+  );
+
+  const inner = (
+    <>
       <p className="line-clamp-2 text-sm font-medium leading-snug">
         {task.title}
       </p>
@@ -71,8 +91,33 @@ export function BoardTaskCard({ task }: BoardTaskCardProps) {
           </span>
         )}
       </div>
-    </Card>
+    </>
   );
+
+  if (interactive) {
+    // We render the interactive card as a real `<button>` (rather than a
+    // div with role=button) so Enter/Space activation, focus order, and
+    // disabled-state semantics all come from the platform. The shadcn Card
+    // primitive is a div under the hood and doesn't expose `asChild`, so we
+    // borrow its base styling via className rather than its element. The
+    // aria-label gives screen-reader users the title up front since the
+    // visible label is line-clamped.
+    return (
+      <button
+        type="button"
+        onClick={() => onSelect?.(task)}
+        aria-label={`Open task: ${task.title}`}
+        className={cn(
+          "rounded-lg border bg-background text-foreground shadow-sm",
+          cardClassName,
+        )}
+      >
+        {inner}
+      </button>
+    );
+  }
+
+  return <Card className={cardClassName}>{inner}</Card>;
 }
 
 /* -------------------------------------------------------------------------- */

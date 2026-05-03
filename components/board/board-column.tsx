@@ -4,7 +4,7 @@ import { Layers, Plus } from "lucide-react";
 
 import { cn } from "@/lib/client/utils";
 import { BoardTaskCard } from "@/components/board/board-task-card";
-import type { BoardColumnData } from "@/components/board/types";
+import type { BoardColumnData, BoardTask } from "@/components/board/types";
 
 /* -------------------------------------------------------------------------- */
 /*                                   Column                                   */
@@ -26,6 +26,11 @@ type BoardColumnProps = {
    * column just signals "open the dialog targeting me".
    */
   onRequestAddTask?: () => void;
+  /**
+   * Click handler for an individual task card. Routed up to the board so it
+   * can open the shared task-detail modal targeting the selected task.
+   */
+  onSelectTask?: (task: BoardTask) => void;
 };
 
 /**
@@ -44,6 +49,7 @@ export function BoardColumn({
   column,
   canAddTask = false,
   onRequestAddTask,
+  onSelectTask,
 }: BoardColumnProps) {
   const taskCount = column.tasks.length;
 
@@ -72,7 +78,7 @@ export function BoardColumn({
         ) : (
           column.tasks.map((task) => (
             <li key={task.id}>
-              <BoardTaskCard task={task} />
+              <BoardTaskCard task={task} onSelect={onSelectTask} />
             </li>
           ))
         )}
