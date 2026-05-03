@@ -1,3 +1,4 @@
+import { asc, count, eq, sql } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
@@ -10,8 +11,9 @@ import {
 } from "@/lib/db/schema";
 import { auth } from "@/lib/server/auth";
 
-// Always treat as dynamic: this handler reads the session cookie and writes to
-// the database, so prerender / route caching must not apply.
+// Always treat as dynamic: every handler in this file reads the session
+// cookie and queries (or writes) the database. The GET response also
+// embeds per-user `isMember`, so prerender / route caching must not apply.
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
@@ -26,7 +28,7 @@ const DEFAULT_COLUMNS = [
   { name: "Done", position: 2 },
 ] as const;
 
-type CreateTeamErrorCode =
+type TeamsErrorCode =
   | "INVALID_JSON"
   | "INVALID_INPUT"
   | "UNAUTHENTICATED"
@@ -35,7 +37,7 @@ type CreateTeamErrorCode =
 
 const errorResponse = (
   status: number,
-  code: CreateTeamErrorCode,
+  code: TeamsErrorCode,
   message: string,
   details?: unknown,
 ): NextResponse =>
@@ -190,6 +192,68 @@ export async function POST(request: Request): Promise<NextResponse> {
       500,
       "INTERNAL_ERROR",
       "Unable to create team at this time",
+    );
+  }
+}
+
+/**
+ * List every team in the caller's tenant.
+ *
+ * Response shape: `{ teams: Array<{ id, name, createdAt, memberCount,
+ * isMember }> }`, sorted by `name` ascending.
+ *
+ *   - `memberCount` is the number of `team_memberships` rows for the team
+ *     (admins + members), aggregated server-side so the client doesn't have
+ *     to issue N+1 lookups.
+ *   - `isMember` is true iff the *current* user has a membership row in the
+ *     team. We compute it in the same aggregate pass via BOOL_OR over the
+ *     left-joined memberships, so a team with zero members correctly gets
+ *     `false` (COALESCE turns the NULL aggregate into false).
+ *
+ * Authorization: any authenticated user in the tenant may list — this is the
+ * directory view that powers "join a team" UX. Tenant isolation is enforced
+ * by the WHERE clause on `tenantId` taken from the JWT claim; we never
+ * accept a tenantId from query string or body.
+ *
+ * Caching: forced dynamic at the file scope above. Per-tenant + per-user
+ * `isMember` makes the response unsafe to share across users, so even an
+ * accidental fetch cache hit would leak membership state.
+ */
+export async function GET(): Promise<NextResponse> {
+  const session = await auth();
+  if (!session?.user?.id || !session.user.tenantId) {
+    return errorResponse(401, "UNAUTHENTICATED", "Sign in to continue");
+  }
+
+  const tenantId = session.user.tenantId;
+  const userId = session.user.id;
+
+  try {
+    // LEFT JOIN keeps teams with zero memberships in the result. We aggregate
+    // by team to get both the member count and the current-user membership
+    // flag in a single round-trip; BOOL_OR returns NULL on an empty group, so
+    // we COALESCE it to false to keep the response shape boolean-only.
+    const rows = await db
+      .select({
+        id: teams.id,
+        name: teams.name,
+        createdAt: teams.createdAt,
+        memberCount: count(teamMemberships.userId),
+        isMember: sql<boolean>`COALESCE(BOOL_OR(${teamMemberships.userId} = ${userId}), false)`,
+      })
+      .from(teams)
+      .leftJoin(teamMemberships, eq(teamMemberships.teamId, teams.id))
+      .where(eq(teams.tenantId, tenantId))
+      .groupBy(teams.id)
+      .orderBy(asc(teams.name));
+
+    return NextResponse.json({ teams: rows }, { status: 200 });
+  } catch (err: unknown) {
+    console.error("[GET /api/teams] unexpected error", err);
+    return errorResponse(
+      500,
+      "INTERNAL_ERROR",
+      "Unable to load teams at this time",
     );
   }
 }
