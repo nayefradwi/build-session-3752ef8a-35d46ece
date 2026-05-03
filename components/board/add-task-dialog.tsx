@@ -25,7 +25,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
+import { MarkdownEditor } from "@/components/board/markdown-editor";
 import type { BoardTask, BoardTaskAssignee } from "@/components/board/types";
 
 /* -------------------------------------------------------------------------- */
@@ -354,16 +354,18 @@ export function AddTaskDialog({
                 (optional)
               </span>
             </Label>
-            <Textarea
+            <MarkdownEditor
               id={descriptionInputId}
               name="description"
-              maxLength={DESCRIPTION_MAX}
-              placeholder="Add more context, links, acceptance criteria…"
               value={description}
-              onChange={(event) => {
-                setDescription(event.target.value);
+              onChange={(next) => {
+                setDescription(next);
                 if (descriptionError) setDescriptionError(null);
               }}
+              placeholder="Add more context, links, acceptance criteria…"
+              maxLength={DESCRIPTION_MAX}
+              rows={4}
+              disabled={submitting}
               aria-invalid={Boolean(descriptionError)}
               aria-describedby={cn(
                 descriptionHintId,
@@ -371,14 +373,12 @@ export function AddTaskDialog({
               )
                 .trim()
                 .replace(/\s+/g, " ")}
-              disabled={submitting}
-              rows={4}
             />
             <div
               id={descriptionHintId}
               className="flex items-center justify-between gap-2 text-xs text-muted-foreground"
             >
-              <span>Markdown supported.</span>
+              <span>Markdown supported — switch to Preview to see the rendered output.</span>
               <span aria-live="polite">
                 {descriptionLength.toLocaleString()}/
                 {DESCRIPTION_MAX.toLocaleString()}
