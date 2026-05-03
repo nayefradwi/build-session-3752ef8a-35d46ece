@@ -272,6 +272,45 @@ export type NewProject = typeof projects.$inferInsert;
 export type Column = typeof columns.$inferSelect;
 export type NewColumn = typeof columns.$inferInsert;
 
+// Tasks are work items that live inside a column. Title is required;
+// description and assignee are optional. `position` is the integer order
+// key within the column (no uniqueness constraint — UI is free to compact /
+// re-balance positions when reordering, and transient ties are tolerated).
+export const tasks = pgTable(
+  "tasks",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    columnId: uuid("column_id")
+      .notNull()
+      .references(() => columns.id, { onDelete: "cascade" }),
+    title: text("title").notNull(),
+    description: text("description"),
+    // Assignee is a tenant user. SET NULL on user delete so the task
+    // survives the user's removal but becomes unassigned.
+    assigneeId: uuid("assignee_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    position: integer("position").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    // "List a column's tasks ordered by position" is the dominant read
+    // path; index the FK.
+    index("tasks_column_id_idx").on(table.columnId),
+    // "List tasks assigned to me" / per-user dashboards filter by
+    // assigneeId, so it gets its own index.
+    index("tasks_assignee_id_idx").on(table.assigneeId),
+  ],
+);
+
+export type Task = typeof tasks.$inferSelect;
+export type NewTask = typeof tasks.$inferInsert;
+
 // Re-export `sql` so callers downstream can use raw expressions without
 // re-importing drizzle-orm directly from the schema module.
 export { sql };
