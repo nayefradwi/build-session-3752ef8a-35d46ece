@@ -1,8 +1,18 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSession } from "next-auth/react";
+import {
+  DndContext,
+  DragOverlay,
+  PointerSensor,
+  closestCorners,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+  type DragStartEvent,
+} from "@dnd-kit/core";
 import {
   AlertCircle,
   ArrowLeft,
@@ -12,11 +22,13 @@ import {
   Plus,
   RefreshCw,
 } from "lucide-react";
+import { toast } from "sonner";
 
 import { ApiError, apiClient } from "@/lib/client/api-client";
 import { cn } from "@/lib/client/utils";
 import { Button } from "@/components/ui/button";
 import { BoardColumn, BoardColumnSkeleton } from "@/components/board/board-column";
+import { BoardTaskCard } from "@/components/board/board-task-card";
 import { AddColumnDialog } from "@/components/board/add-column-dialog";
 import {
   AddTaskDialog,
@@ -24,6 +36,78 @@ import {
 } from "@/components/board/add-task-dialog";
 import { TaskDetailModal } from "@/components/board/task-detail-modal";
 import type { BoardColumnData, BoardTask } from "@/components/board/types";
+
+/* -------------------------------------------------------------------------- */
+/*                          Optimistic move helper                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Pure splice helper: produce a new `columns` array with the given task
+ * relocated to `targetColumnId` at index `newPosition`. Mirrors the server
+ * algorithm in PATCH /api/tasks/[taskId]/move:
+ *
+ *   1. Pull the moving task out of its source lane.
+ *   2. Insert it at the clamped index in the target lane (clamp matches
+ *      the server: [0, length] for cross-column, [0, length] same-column
+ *      after removal).
+ *   3. Re-stamp positions to a contiguous 0..N-1 range in both lanes so
+ *      sibling cards reflect their post-move slot. The server does the
+ *      same compaction; computing it here keeps the optimistic UI in
+ *      sync with whatever the server will respond.
+ *
+ * Returns `null` if the task can't be located in the snapshot (defensive —
+ * a stale callsite shouldn't crash, just no-op).
+ */
+function applyOptimisticMove(
+  columns: BoardColumnData[],
+  taskId: string,
+  targetColumnId: string,
+  newPosition: number,
+): BoardColumnData[] | null {
+  let movingTask: BoardTask | null = null;
+
+  const stripped = columns.map((col) => {
+    const idx = col.tasks.findIndex((t) => t.id === taskId);
+    if (idx === -1) return col;
+    movingTask = col.tasks[idx];
+    return {
+      ...col,
+      tasks: col.tasks.filter((t) => t.id !== taskId),
+    };
+  });
+
+  if (!movingTask) return null;
+  const moving: BoardTask = movingTask;
+
+  const next = stripped.map((col) => {
+    if (col.id !== targetColumnId) {
+      // Source lane (or any other untouched lane): re-stamp positions so
+      // the gap left behind closes contiguously, matching the server's
+      // post-move compaction.
+      const tasks = col.tasks.map((t, i) =>
+        t.position === i ? t : { ...t, position: i },
+      );
+      return tasks === col.tasks ? col : { ...col, tasks };
+    }
+    const insertIdx = Math.min(
+      Math.max(Math.floor(newPosition), 0),
+      col.tasks.length,
+    );
+    const inserted: BoardTask = {
+      ...moving,
+      columnId: targetColumnId,
+      position: insertIdx,
+    };
+    const merged = [
+      ...col.tasks.slice(0, insertIdx),
+      inserted,
+      ...col.tasks.slice(insertIdx),
+    ].map((t, i) => (t.position === i ? t : { ...t, position: i }));
+    return { ...col, tasks: merged };
+  });
+
+  return next;
+}
 
 /* -------------------------------------------------------------------------- */
 /*                                API contracts                               */
@@ -386,6 +470,237 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
     return columns.find((c) => c.id === addTaskColumnId) ?? null;
   }, [addTaskColumnId, columns]);
 
+  /* --------------------------- Drag-and-drop ---------------------------- */
+
+  // Active task being dragged — drives the `DragOverlay` clone. We snapshot
+  // the BoardTask at drag-start (rather than re-deriving from columns on
+  // every render) so the overlay still renders correctly while the source
+  // card is mid-optimistic-splice.
+  const [activeTask, setActiveTask] = useState<BoardTask | null>(null);
+
+  // Snapshot of the columns slice taken at drag-start, so we can roll back
+  // cleanly if the move endpoint fails. We use a ref (not state) because
+  // the rollback never needs to drive a render — it overwrites `columns`
+  // directly via `setColumns`.
+  const rollbackSnapshotRef = useRef<BoardColumnData[] | null>(null);
+
+  // Pointer-distance activation: a click of <6px doesn't trigger a drag,
+  // so the existing "click card → open detail modal" path stays intact.
+  // The keyboard sensor is intentionally omitted — its default activator
+  // (Space) conflicts with the inner `<button>`'s click activation, and
+  // wiring a separate visual handle would dilute the card affordance.
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 6 },
+    }),
+  );
+
+  const handleDragStart = useCallback(
+    (event: DragStartEvent) => {
+      const data = event.active.data.current as
+        | { type?: string; task?: BoardTask }
+        | undefined;
+      if (data?.type !== "task" || !data.task) return;
+      setActiveTask(data.task);
+      rollbackSnapshotRef.current = columns;
+    },
+    [columns],
+  );
+
+  const handleDragCancel = useCallback(() => {
+    setActiveTask(null);
+    rollbackSnapshotRef.current = null;
+  }, []);
+
+  /**
+   * Persist a move via PATCH /api/tasks/[taskId]/move with optimistic UI.
+   *
+   *   - Optimistic state: `setColumns(next)` is already applied by the
+   *     caller. We only roll back on error.
+   *   - Server response: re-stamps positions across the source + target
+   *     columns. Rather than reconciling card-by-card, we just sync the
+   *     moved task's columnId/position into the local row and rely on the
+   *     re-stamp matching what we computed (the server's clamp + compaction
+   *     algorithm is deterministic given the same inputs the optimistic
+   *     splice used). If a sibling slips a concurrent insert, the next
+   *     full-board refresh will reconcile.
+   *   - On failure: restore the snapshot taken at drag-start and toast.
+   */
+  const persistMove = useCallback(
+    async (
+      taskId: string,
+      targetColumnId: string,
+      newPosition: number,
+      snapshot: BoardColumnData[],
+    ) => {
+      try {
+        const response = await apiClient.patch<{ task: BoardTask & { createdAt: string; updatedAt: string } }>(
+          `/api/tasks/${taskId}/move`,
+          { targetColumnId, newPosition },
+          { silent: true, skipAuthRedirect: false },
+        );
+        // Sync the moved task's authoritative fields back onto local
+        // state. We trust the server on columnId/position/assignee — the
+        // optimistic splice should already match, but re-stamping defensively
+        // keeps state consistent if a concurrent edit landed in between.
+        const moved = response.task;
+        setColumns((prev) =>
+          prev.map((column) => {
+            if (column.id !== moved.columnId) return column;
+            let touched = false;
+            const tasks = column.tasks.map((t) => {
+              if (t.id !== moved.id) return t;
+              touched = true;
+              return {
+                id: moved.id,
+                columnId: moved.columnId,
+                title: moved.title,
+                description: moved.description,
+                position: moved.position,
+                assignee: moved.assignee,
+              };
+            });
+            if (!touched) return column;
+            return { ...column, tasks };
+          }),
+        );
+      } catch (err) {
+        // Roll back to the pre-drag snapshot. We pass the snapshot in
+        // explicitly (rather than reading from the ref) because a fast
+        // user could have started a second drag while the PATCH was in
+        // flight — the ref would be pointing at the wrong moment in time.
+        setColumns(snapshot);
+        const description =
+          err instanceof ApiError
+            ? err.message
+            : "We couldn't move that task. Please try again.";
+        toast.error("Couldn't move task", { description });
+      } finally {
+        rollbackSnapshotRef.current = null;
+      }
+    },
+    [],
+  );
+
+  const handleDragEnd = useCallback(
+    (event: DragEndEvent) => {
+      const { active, over } = event;
+      const snapshot = rollbackSnapshotRef.current;
+      // Always clear the overlay clone — even on a no-op drop, the source
+      // should stop reading as "being dragged".
+      setActiveTask(null);
+
+      if (!over || !snapshot) {
+        rollbackSnapshotRef.current = null;
+        return;
+      }
+
+      const activeId = String(active.id);
+      const activeData = active.data.current as
+        | { type?: string; task?: BoardTask; columnId?: string }
+        | undefined;
+      if (activeData?.type !== "task") {
+        rollbackSnapshotRef.current = null;
+        return;
+      }
+
+      // Resolve the source column from the snapshot — the caller's
+      // pre-drag state is the source of truth here, since by the time we
+      // observe `over` the optimistic state may already differ if dnd-kit
+      // emits any midstream updates.
+      const sourceColumn = snapshot.find((col) =>
+        col.tasks.some((t) => t.id === activeId),
+      );
+      if (!sourceColumn) {
+        rollbackSnapshotRef.current = null;
+        return;
+      }
+
+      // Resolve target column + insert index from the over-element type.
+      const overData = over.data.current as
+        | {
+            type?: string;
+            task?: BoardTask;
+            columnId?: string;
+          }
+        | undefined;
+
+      let targetColumnId: string;
+      let newPosition: number;
+
+      if (overData?.type === "task" && overData.task && overData.columnId) {
+        // Hovered over another task — drop relative to that task.
+        targetColumnId = overData.columnId;
+        const targetCol = snapshot.find((c) => c.id === targetColumnId);
+        if (!targetCol) {
+          rollbackSnapshotRef.current = null;
+          return;
+        }
+        // Index of the over-task in the *original* (snapshot) lane. The
+        // server's "newPosition" semantics match dnd-kit's default
+        // `arrayMove(items, oldIndex, overIndex)`: the moving task ends up
+        // exactly at `overIndex` after the splice (within the same lane),
+        // and at `overIndex` (insert-before) when crossing lanes. So we
+        // forward the snapshot index directly.
+        newPosition = targetCol.tasks.findIndex(
+          (t) => t.id === overData.task!.id,
+        );
+        if (newPosition < 0) {
+          rollbackSnapshotRef.current = null;
+          return;
+        }
+      } else if (overData?.type === "column" && overData.columnId) {
+        // Hovered over a column body (typically: empty lane or trailing
+        // whitespace). Append to the end of the target column. For a
+        // same-column drop here, we use `length - 1` since the moving task
+        // is already in the column and "append" really means "park at the
+        // last slot" — server clamps anyway, but matching the math keeps
+        // the optimistic state from temporarily showing the card past the
+        // end.
+        targetColumnId = overData.columnId;
+        const targetCol = snapshot.find((c) => c.id === targetColumnId);
+        if (!targetCol) {
+          rollbackSnapshotRef.current = null;
+          return;
+        }
+        const sameColumn = sourceColumn.id === targetColumnId;
+        newPosition = sameColumn
+          ? Math.max(targetCol.tasks.length - 1, 0)
+          : targetCol.tasks.length;
+      } else {
+        rollbackSnapshotRef.current = null;
+        return;
+      }
+
+      // Compute the optimistic next state.
+      const next = applyOptimisticMove(
+        snapshot,
+        activeId,
+        targetColumnId,
+        newPosition,
+      );
+      if (!next) {
+        // Couldn't locate the moving task — bail and clear the snapshot.
+        rollbackSnapshotRef.current = null;
+        return;
+      }
+
+      // No-op drop: source column + position unchanged. Skip the round
+      // trip entirely so dragging a card and dropping it back where it
+      // started doesn't churn the database.
+      const sameColumn = sourceColumn.id === targetColumnId;
+      const oldIndex = sourceColumn.tasks.findIndex((t) => t.id === activeId);
+      if (sameColumn && oldIndex === newPosition) {
+        rollbackSnapshotRef.current = null;
+        return;
+      }
+
+      setColumns(next);
+      void persistMove(activeId, targetColumnId, newPosition, snapshot);
+    },
+    [persistMove],
+  );
+
   /* ------------------------------- Render -------------------------------- */
 
   if (sessionStatus === "loading" || (loading && !project && !error && !notFound && !forbidden)) {
@@ -406,18 +721,44 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
 
   return (
     <>
-      <BoardLayout
-        teamId={teamId}
-        project={project}
-        isMember={isMember}
-        isTeamAdmin={isTeamAdmin}
-        columns={columns}
-        loading={loading}
-        onRefresh={() => void loadBoard()}
-        onRequestAddColumn={() => setAddColumnOpen(true)}
-        onRequestAddTask={(columnId) => setAddTaskColumnId(columnId)}
-        onSelectTask={(task) => setDetailTaskId(task.id)}
-      />
+      <DndContext
+        sensors={sensors}
+        // closestCorners works well for a kanban: the active card's corners
+        // get matched against both sortable items (siblings) and the column
+        // droppable, so dropping near the top of a lane reliably resolves
+        // to the first task and dropping past the last card resolves to
+        // the column's whitespace.
+        collisionDetection={closestCorners}
+        onDragStart={handleDragStart}
+        onDragEnd={handleDragEnd}
+        onDragCancel={handleDragCancel}
+      >
+        <BoardLayout
+          teamId={teamId}
+          project={project}
+          isMember={isMember}
+          isTeamAdmin={isTeamAdmin}
+          columns={columns}
+          loading={loading}
+          onRefresh={() => void loadBoard()}
+          onRequestAddColumn={() => setAddColumnOpen(true)}
+          onRequestAddTask={(columnId) => setAddTaskColumnId(columnId)}
+          onSelectTask={(task) => setDetailTaskId(task.id)}
+        />
+        {/* The DragOverlay clone follows the cursor while a drag is in
+            progress. We render a non-interactive `BoardTaskCard` (no
+            `onSelect`) so the clone doesn't try to absorb pointer events
+            — it's purely a visual mirror of the source card. The slight
+            rotation + larger shadow are conventional cues that the card
+            is "lifted" above the board. */}
+        <DragOverlay dropAnimation={null}>
+          {activeTask ? (
+            <div className="rotate-2 cursor-grabbing shadow-2xl">
+              <BoardTaskCard task={activeTask} />
+            </div>
+          ) : null}
+        </DragOverlay>
+      </DndContext>
       {/* Mounted only when we know the projectId AND the caller is a team
           admin — the dialog needs the projectId to POST against, and the
           server will 403 a non-admin's submission anyway. */}
@@ -502,6 +843,10 @@ function BoardLayout({
   onRequestAddTask,
   onSelectTask,
 }: BoardLayoutProps) {
+  // The drag-to-reorder gesture mirrors the server-side member check on
+  // PATCH /api/tasks/[taskId]/move. Visitors of a public project can still
+  // click cards open, but the gesture stays hidden for them.
+  const canReorder = isMember;
   const totalTasks = useMemo(
     () => columns.reduce((sum, col) => sum + col.tasks.length, 0),
     [columns],
@@ -560,6 +905,7 @@ function BoardLayout({
         onRequestAddColumn={onRequestAddColumn}
         onRequestAddTask={onRequestAddTask}
         onSelectTask={onSelectTask}
+        canReorder={canReorder}
       />
     </div>
   );
@@ -576,6 +922,13 @@ type BoardColumnsProps = {
   onRequestAddColumn: () => void;
   onRequestAddTask: (columnId: string) => void;
   onSelectTask: (task: BoardTask) => void;
+  /**
+   * When true, task cards are draggable and columns are drop targets. The
+   * gesture is gated on team membership (the move endpoint 403s for
+   * non-members), so visitors of a public project still see a clickable
+   * read-only board but no drag affordance.
+   */
+  canReorder: boolean;
 };
 
 function BoardColumns({
@@ -585,6 +938,7 @@ function BoardColumns({
   onRequestAddColumn,
   onRequestAddTask,
   onSelectTask,
+  canReorder,
 }: BoardColumnsProps) {
   if (columns.length === 0) {
     return (
@@ -630,6 +984,10 @@ function BoardColumns({
             // project (non-members) still get this — the GET endpoint only
             // requires tenant + project visibility, not membership.
             onSelectTask={onSelectTask}
+            // Drag-to-reorder is gated on the same team-member rule as
+            // task creation, since the move endpoint enforces the check
+            // server-side anyway.
+            canReorder={canReorder}
           />
         ))}
         {canAddColumn ? (

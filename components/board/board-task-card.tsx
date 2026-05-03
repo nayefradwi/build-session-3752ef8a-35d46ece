@@ -1,5 +1,7 @@
 "use client";
 
+import type { CSSProperties, HTMLAttributes, Ref } from "react";
+
 import { cn } from "@/lib/client/utils";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Card } from "@/components/ui/card";
@@ -29,6 +31,19 @@ const initialsFromAssignee = (assignee: BoardTaskAssignee): string => {
 /*                                 Task card                                  */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Drag-handle props produced by `useSortable` from `@dnd-kit/sortable` and
+ * forwarded by {@link import("./sortable-task-card").SortableBoardTaskCard}
+ * so the inner `<button>` becomes the activator for the drag gesture (with
+ * a small pointer-distance threshold, so a quick click still opens the task
+ * detail modal). The shape is `HTMLAttributes` plus an optional `ref` because
+ * dnd-kit's `setActivatorNodeRef` is what wires the activator into its
+ * internal accessibility tree.
+ */
+export type BoardTaskDragHandleProps = HTMLAttributes<HTMLButtonElement> & {
+  ref?: Ref<HTMLButtonElement>;
+};
+
 type BoardTaskCardProps = {
   task: BoardTask;
   /**
@@ -39,6 +54,22 @@ type BoardTaskCardProps = {
    * skeleton/placeholder paths use this).
    */
   onSelect?: (task: BoardTask) => void;
+  /**
+   * Drag-handle props from `useSortable`. When provided AND `onSelect` is
+   * also provided, the inner `<button>` doubles as the drag activator. We
+   * keep this off the non-interactive path on purpose — skeleton cards
+   * shouldn't accidentally start a drag.
+   */
+  dragHandleProps?: BoardTaskDragHandleProps;
+  /**
+   * Visual hint that this card's row is currently being dragged. The card
+   * stays mounted (so dnd-kit can measure layout for the placeholder slot)
+   * but renders as a translucent silhouette while a `DragOverlay` clone is
+   * shown at the cursor instead.
+   */
+  isDragging?: boolean;
+  /** Optional inline style passthrough (used for the drag overlay clone). */
+  style?: CSSProperties;
 };
 
 /**
@@ -61,13 +92,23 @@ type BoardTaskCardProps = {
  *   - When `onSelect` is omitted the card stays a plain `<div>` so callsites
  *     that render skeleton/preview cards don't get the focus ring.
  */
-export function BoardTaskCard({ task, onSelect }: BoardTaskCardProps) {
+export function BoardTaskCard({
+  task,
+  onSelect,
+  dragHandleProps,
+  isDragging = false,
+  style,
+}: BoardTaskCardProps) {
   const interactive = typeof onSelect === "function";
   const cardClassName = cn(
     "block w-full space-y-2 rounded-md border bg-background p-3 text-left shadow-sm transition-colors",
     "hover:border-foreground/30 hover:shadow-md",
     interactive &&
       "cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ring-offset-background",
+    // While a drag is in progress, the source card stays mounted but reads
+    // as a placeholder slot (translucent + dashed border) so the layout
+    // doesn't reflow as the DragOverlay clone moves with the cursor.
+    isDragging && "opacity-40 border-dashed shadow-none",
   );
 
   const inner = (
@@ -102,22 +143,36 @@ export function BoardTaskCard({ task, onSelect }: BoardTaskCardProps) {
     // borrow its base styling via className rather than its element. The
     // aria-label gives screen-reader users the title up front since the
     // visible label is line-clamped.
+    //
+    // When `dragHandleProps` is supplied (sortable mode) we spread it onto
+    // the button so it doubles as the drag activator. The PointerSensor's
+    // distance constraint keeps a quick click → onSelect (open detail
+    // modal) path working: a press without movement past the threshold
+    // never starts a drag and the synthesized click fires normally.
+    const { ref: dragRef, ...dragRest } = dragHandleProps ?? {};
     return (
       <button
+        ref={dragRef}
         type="button"
         onClick={() => onSelect?.(task)}
         aria-label={`Open task: ${task.title}`}
+        style={style}
         className={cn(
           "rounded-lg border bg-background text-foreground shadow-sm",
           cardClassName,
         )}
+        {...dragRest}
       >
         {inner}
       </button>
     );
   }
 
-  return <Card className={cardClassName}>{inner}</Card>;
+  return (
+    <Card className={cardClassName} style={style}>
+      {inner}
+    </Card>
+  );
 }
 
 /* -------------------------------------------------------------------------- */
