@@ -34,3 +34,7 @@ yarn-error.log*
 
 # typescript
 *.tsbuildinfo
+
+# attachment uploads (UPLOAD_DIR — see .env.example). The directory is
+# created at app startup; we never check uploaded files into git.
+/uploads/

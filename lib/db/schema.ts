@@ -311,6 +311,46 @@ export const tasks = pgTable(
 export type Task = typeof tasks.$inferSelect;
 export type NewTask = typeof tasks.$inferInsert;
 
+// Attachments are files uploaded against a task. We store the original
+// filename for display, plus the on-disk path the upload handler wrote to.
+// MIME type and size are recorded at upload time and surfaced on the task
+// detail payload so clients can render previews without restating each file.
+//
+// Storage backend: local filesystem under `process.env.UPLOAD_DIR` (default
+// `./uploads`). The `storagePath` column is opaque to callers — they must
+// stream through the download route, never join a path on the client. When
+// the storage driver moves to object storage (S3, etc.), only `storagePath`
+// semantics change; the column stays as the canonical reference.
+export const attachments = pgTable(
+  "attachments",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    taskId: uuid("task_id")
+      .notNull()
+      .references(() => tasks.id, { onDelete: "cascade" }),
+    // Original filename as supplied by the uploader (display only).
+    filename: text("filename").notNull(),
+    // Server-side path the upload was written to (relative to UPLOAD_DIR or
+    // absolute, depending on how UPLOAD_DIR was configured). Opaque to clients.
+    storagePath: text("storage_path").notNull(),
+    mimeType: text("mime_type").notNull(),
+    // Size in bytes. `integer` (32-bit signed) caps at ~2.1 GB which is well
+    // above MAX_UPLOAD_SIZE_BYTES; if that ever changes, widen this column.
+    size: integer("size").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    // "List a task's attachments" is the dominant read pattern (task detail
+    // payload includes them). Index the FK so the planner can range-scan.
+    index("attachments_task_id_idx").on(table.taskId),
+  ],
+);
+
+export type Attachment = typeof attachments.$inferSelect;
+export type NewAttachment = typeof attachments.$inferInsert;
+
 // Re-export `sql` so callers downstream can use raw expressions without
 // re-importing drizzle-orm directly from the schema module.
 export { sql };

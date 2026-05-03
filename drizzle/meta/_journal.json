@@ -29,6 +29,13 @@
       "when": 1777802101379,
       "tag": "0003_supreme_ink",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1777803581605,
+      "tag": "0004_attachments",
+      "breakpoints": true
     }
   ]
 }
