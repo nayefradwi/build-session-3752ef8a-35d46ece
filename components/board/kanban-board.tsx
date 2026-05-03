@@ -335,6 +335,24 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
     );
   }, []);
 
+  // Splice-on-success for task deletes: the DELETE handler returns 204 with
+  // no body, so the modal hands us only the deleted task's id. We walk every
+  // column (rather than guessing the owning column from stale state) and
+  // drop the matching row. A no-op pass through `prev` is returned when
+  // nothing changes so React skips the re-render.
+  const handleTaskDeleted = useCallback((taskId: string) => {
+    setColumns((prev) => {
+      let touched = false;
+      const next = prev.map((column) => {
+        const filtered = column.tasks.filter((t) => t.id !== taskId);
+        if (filtered.length === column.tasks.length) return column;
+        touched = true;
+        return { ...column, tasks: filtered };
+      });
+      return touched ? next : prev;
+    });
+  }, []);
+
   // Sync-on-success for task edits: the PUT handler returns the updated
   // task (including columnId/position, which the edit form doesn't touch
   // but we read defensively in case a future surface adds them). We swap
@@ -449,6 +467,7 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
         canEdit={isMember}
         members={teamMembers}
         onUpdated={handleTaskUpdated}
+        onDeleted={handleTaskDeleted}
       />
     </>
   );

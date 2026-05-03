@@ -19,6 +19,7 @@ import {
   Paperclip,
   Pencil,
   RefreshCw,
+  Trash2,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -27,7 +28,17 @@ import { toast } from "sonner";
 import { ApiError, apiClient } from "@/lib/client/api-client";
 import { cn } from "@/lib/client/utils";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import {
   Dialog,
   DialogClose,
@@ -197,6 +208,13 @@ export type TaskDetailModalProps = {
    * touched card reflects the new fields without a full board refetch.
    */
   onUpdated?: (task: BoardTask) => void;
+  /**
+   * Called with the deleted task's id on a successful delete. The caller is
+   * expected to remove the matching card from its local board state so the
+   * deletion is reflected without a full board refetch. The modal closes
+   * itself once the callback returns.
+   */
+  onDeleted?: (taskId: string) => void;
 };
 
 /**
@@ -249,6 +267,7 @@ export function TaskDetailModal({
   canEdit = false,
   members,
   onUpdated,
+  onDeleted,
 }: TaskDetailModalProps) {
   const [task, setTask] = useState<TaskDetail | null>(null);
   const [loading, setLoading] = useState(false);
@@ -264,6 +283,15 @@ export function TaskDetailModal({
   // Save in-flight indicator. While true the dialog can't be dismissed and
   // the form controls are disabled.
   const [saving, setSaving] = useState(false);
+  // Confirm-delete dialog visibility. Lifted into the modal so the read-body
+  // and the AlertDialog stay coordinated — the delete trigger flips this on
+  // and the AlertDialog drives it back off via Cancel / outside-blocked
+  // dismiss / completed action.
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  // Delete in-flight indicator. While true the AlertDialog can't be
+  // dismissed (Cancel disabled, outside-click ignored) and the parent
+  // Dialog also blocks dismissal so the user can't navigate away mid-call.
+  const [deleting, setDeleting] = useState(false);
 
   // Reset transient state every time the dialog closes so a re-open on the
   // same id doesn't briefly flash the previous task's content (or stale
@@ -277,6 +305,8 @@ export function TaskDetailModal({
       setLoading(false);
       setEditing(false);
       setSaving(false);
+      setConfirmDeleteOpen(false);
+      setDeleting(false);
     }
   }, [open]);
 
@@ -367,13 +397,61 @@ export function TaskDetailModal({
     [onUpdated],
   );
 
+  // Confirmed delete path. Fires DELETE /api/tasks/[taskId], surfaces a
+  // success toast, lets the parent splice the card out of local board
+  // state, and closes both the AlertDialog and the parent Dialog. On
+  // failure we keep the AlertDialog open so the user can retry without
+  // losing context — the toast describes what went wrong.
+  const handleConfirmDelete = useCallback(async () => {
+    if (!task || deleting) return;
+    setDeleting(true);
+    try {
+      await apiClient.delete(`/api/tasks/${task.id}`, {
+        silent: true,
+        skipAuthRedirect: true,
+      });
+      toast.success("Task deleted", {
+        description: `“${task.title}” has been deleted.`,
+      });
+      onDeleted?.(task.id);
+      // Close the confirmation dialog AND the parent modal in one shot.
+      // We flip these in sequence (rather than relying solely on the parent
+      // Dialog's onOpenChange) so the AlertDialog's exit animation runs
+      // before the parent unmounts the modal subtree.
+      setConfirmDeleteOpen(false);
+      onOpenChange(false);
+    } catch (err) {
+      if (err instanceof ApiError) {
+        if (err.status === 404) {
+          // The row is already gone — treat as a successful no-op so the
+          // user isn't stuck on a stale card. Forward to the parent so the
+          // local board state catches up.
+          toast.success("Task deleted", {
+            description: "This task was already removed.",
+          });
+          onDeleted?.(task.id);
+          setConfirmDeleteOpen(false);
+          onOpenChange(false);
+        } else {
+          toast.error("Couldn't delete task", { description: err.message });
+        }
+      } else {
+        toast.error("Couldn't delete task", {
+          description: "Something went wrong. Please try again.",
+        });
+      }
+    } finally {
+      setDeleting(false);
+    }
+  }, [deleting, onDeleted, onOpenChange, task]);
+
   return (
     <Dialog
       open={open}
       onOpenChange={(next) => {
-        // Block dismiss while a save is in flight so we don't strand the
-        // user without confirmation of the result.
-        if (saving && !next) return;
+        // Block dismiss while a save or delete is in flight so we don't
+        // strand the user without confirmation of the result.
+        if ((saving || deleting) && !next) return;
         onOpenChange(next);
       }}
     >
@@ -417,10 +495,72 @@ export function TaskDetailModal({
               canEdit={canEdit}
               onEdit={() => setEditing(true)}
               onClose={() => onOpenChange(false)}
+              onRequestDelete={() => setConfirmDeleteOpen(true)}
             />
           )
         ) : null}
       </DialogContent>
+      {/* Delete-confirmation AlertDialog. Mounted as a sibling of the parent
+          Dialog (rather than nested inside DialogContent) so the alert's
+          overlay stacks above the modal cleanly and Radix can manage focus
+          correctly between the two surfaces. We only enable confirm when a
+          task is actually loaded — the trigger is gated on `canEdit && task`
+          so this is a defensive guard against an interleaved state flip. */}
+      {task ? (
+        <AlertDialog
+          open={confirmDeleteOpen}
+          onOpenChange={(next) => {
+            // Block dismissal while the DELETE is in flight so the user
+            // can't navigate away mid-call and miss the toast.
+            if (deleting && !next) return;
+            setConfirmDeleteOpen(next);
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Delete this task?</AlertDialogTitle>
+              <AlertDialogDescription>
+                “{task.title}” will be permanently removed. This can&apos;t be
+                undone.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
+              {/* The Action is themed as destructive — irreversible removal
+                  warrants the louder color. We override the default
+                  buttonVariants() class via className. */}
+              <AlertDialogAction
+                className={cn(buttonVariants({ variant: "destructive" }))}
+                disabled={deleting}
+                onClick={(event) => {
+                  // Prevent Radix's default "close on action" behavior so we
+                  // can keep the AlertDialog open until the network round-
+                  // trip resolves. Without this, the dialog closes
+                  // immediately on click and a slow/failing DELETE would
+                  // strand the user with no feedback surface.
+                  event.preventDefault();
+                  void handleConfirmDelete();
+                }}
+              >
+                {deleting ? (
+                  <>
+                    <Loader2
+                      className="h-4 w-4 animate-spin"
+                      aria-hidden="true"
+                    />
+                    Deleting…
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="h-4 w-4" aria-hidden="true" />
+                    Delete
+                  </>
+                )}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      ) : null}
     </Dialog>
   );
 }
@@ -434,11 +574,13 @@ function TaskDetailBody({
   canEdit,
   onEdit,
   onClose,
+  onRequestDelete,
 }: {
   task: TaskDetail;
   canEdit: boolean;
   onEdit: () => void;
   onClose: () => void;
+  onRequestDelete: () => void;
 }) {
   return (
     <>
@@ -550,18 +692,38 @@ function TaskDetailBody({
         </section>
       </div>
 
-      <DialogFooter>
-        <DialogClose asChild>
-          <Button type="button" variant="outline" onClick={onClose}>
-            Close
-          </Button>
-        </DialogClose>
+      <DialogFooter className="sm:justify-between">
+        {/* Destructive action lives on the leading edge of the footer so it's
+            visually separated from the benign Close / Edit affordances and
+            the user is less likely to muscle-memory it. Gated on `canEdit`
+            (i.e. team membership) — the DELETE endpoint 403s non-members. */}
         {canEdit ? (
-          <Button type="button" onClick={onEdit}>
-            <Pencil className="h-4 w-4" aria-hidden="true" />
-            Edit
+          <Button
+            type="button"
+            variant="destructive"
+            onClick={onRequestDelete}
+          >
+            <Trash2 className="h-4 w-4" aria-hidden="true" />
+            Delete
           </Button>
-        ) : null}
+        ) : (
+          // Spacer so the Close/Edit cluster stays right-aligned even when
+          // the Delete affordance is hidden for non-members.
+          <span aria-hidden="true" />
+        )}
+        <div className="flex flex-col-reverse gap-2 sm:flex-row sm:gap-2">
+          <DialogClose asChild>
+            <Button type="button" variant="outline" onClick={onClose}>
+              Close
+            </Button>
+          </DialogClose>
+          {canEdit ? (
+            <Button type="button" onClick={onEdit}>
+              <Pencil className="h-4 w-4" aria-hidden="true" />
+              Edit
+            </Button>
+          ) : null}
+        </div>
       </DialogFooter>
     </>
   );
