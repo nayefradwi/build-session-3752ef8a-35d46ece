@@ -1,9 +1,9 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { db } from "@/lib/db";
-import { columns, tasks, users } from "@/lib/db/schema";
+import { columns, tasks, teamMemberships, users } from "@/lib/db/schema";
 import { auth } from "@/lib/server/auth";
 import { resolveProjectAccessByProjectId } from "@/lib/server/projects/access";
 
@@ -15,6 +15,7 @@ export const runtime = "nodejs";
 
 type TaskDetailErrorCode =
   | "INVALID_INPUT"
+  | "INVALID_JSON"
   | "UNAUTHENTICATED"
   | "FORBIDDEN"
   | "NOT_FOUND"
@@ -183,6 +184,268 @@ export async function GET(
       500,
       "INTERNAL_ERROR",
       "Unable to load task at this time",
+    );
+  }
+}
+
+// Hard upper bounds — mirrored from the create endpoint so that an entry
+// created within the limit can also be edited up to the same limit. Title is
+// a single board-card line; description is the long-form body.
+const TITLE_MAX_LENGTH = 200;
+const DESCRIPTION_MAX_LENGTH = 10_000;
+
+/**
+ * Update payload. We deliberately distinguish "field absent" from "field
+ * present with null":
+ *
+ *   - `title` is required on every update — it's the human-readable handle on
+ *     the card and the schema column is NOT NULL. Trimmed + non-empty + max
+ *     200 chars (whitespace-only titles fail the min(1) check).
+ *   - `description` is optional. Omit to leave the existing value untouched;
+ *     pass `null` (or "" / whitespace-only) to explicitly clear it.
+ *   - `assigneeId` is optional. Omit to leave the existing assignee untouched;
+ *     pass `null` to unassign. If a UUID is supplied, the user must be a
+ *     member of the owning team — assigning work outside the team would put
+ *     a card in front of someone who can't even view the project.
+ *
+ * The optional+nullable shape gives us a tri-valued field (`undefined | null
+ * | T`) that the handler reads to decide between "skip", "clear", and "set".
+ */
+const updateTaskInputSchema = z.object({
+  title: z.string().trim().min(1).max(TITLE_MAX_LENGTH),
+  description: z
+    .string()
+    .max(DESCRIPTION_MAX_LENGTH)
+    .nullable()
+    .optional()
+    .transform((v) => {
+      if (v === undefined) return undefined;
+      if (v === null) return null;
+      const trimmed = v.trim();
+      // Empty / whitespace-only collapses to an explicit clear so the wire
+      // semantic of "" matches null at the DB layer.
+      return trimmed === "" ? null : trimmed;
+    }),
+  assigneeId: z.uuid().nullable().optional(),
+});
+
+/**
+ * PUT /api/tasks/[taskId]
+ *
+ * Edit a task's title, description, and/or assignee. updatedAt is bumped
+ * server-side via NOW() so the timestamp reflects the DB clock (matches the
+ * defaultNow stamp on insert and avoids app/DB clock drift).
+ *
+ * Authorization:
+ *   - Caller must be authenticated (401 otherwise).
+ *   - The task's owning project must live in the caller's tenant. Cross-tenant
+ *     or non-existent task ids collapse to 404 to avoid leaking existence.
+ *   - Caller must be a *team member* of the owning team. Public-project
+ *     visibility lets non-members READ the task (see GET above), but writes
+ *     require membership; non-members get 403.
+ *
+ * Body validation (see `updateTaskInputSchema`):
+ *   - `title` required, non-empty after trim, ≤ 200 chars.
+ *   - `description` optional; omit to keep, null/"" to clear, otherwise
+ *     stored trimmed (≤ 10 000 chars).
+ *   - `assigneeId` optional; omit to keep, null to unassign, UUID to set.
+ *     A UUID must reference a member of the owning team (422 otherwise).
+ *
+ * Response shape (200): same as POST /api/projects/[projectId]/tasks —
+ *   { task: { id, columnId, title, description, position, createdAt,
+ *     updatedAt, assignee: { id, name, email } | null } }
+ */
+export async function PUT(
+  request: Request,
+  context: { params: Promise<{ taskId: string }> },
+): Promise<NextResponse> {
+  const session = await auth();
+  if (!session?.user?.id || !session.user.tenantId) {
+    return errorResponse(401, "UNAUTHENTICATED", "Sign in to continue");
+  }
+
+  const { taskId: rawTaskId } = await context.params;
+  const taskIdParse = taskIdParamSchema.safeParse(rawTaskId);
+  if (!taskIdParse.success) {
+    return errorResponse(400, "INVALID_INPUT", "Invalid task id");
+  }
+
+  let rawBody: unknown;
+  try {
+    rawBody = await request.json();
+  } catch {
+    return errorResponse(
+      400,
+      "INVALID_JSON",
+      "Request body must be valid JSON",
+    );
+  }
+
+  const parsed = updateTaskInputSchema.safeParse(rawBody);
+  if (!parsed.success) {
+    return errorResponse(
+      400,
+      "INVALID_INPUT",
+      "Validation failed",
+      z.treeifyError(parsed.error),
+    );
+  }
+  const { title, description, assigneeId } = parsed.data;
+
+  try {
+    // 1. Locate the task and resolve the owning project. We don't check
+    //    tenant in this query — that's the access helper's job below — so a
+    //    cross-tenant task id flows through to step 2 and collapses to 404.
+    const [taskRow] = await db
+      .select({
+        id: tasks.id,
+        projectId: columns.projectId,
+      })
+      .from(tasks)
+      .innerJoin(columns, eq(columns.id, tasks.columnId))
+      .where(eq(tasks.id, taskIdParse.data))
+      .limit(1);
+
+    if (!taskRow) {
+      return errorResponse(404, "NOT_FOUND", "Task not found");
+    }
+
+    // 2. Tenant + visibility gate. Cross-tenant => 404; private-project
+    //    non-member READS would 403 here, but writes get an even stricter
+    //    membership gate in step 3, so the 403 path is consistent.
+    const access = await resolveProjectAccessByProjectId({
+      projectId: taskRow.projectId,
+      tenantId: session.user.tenantId,
+      userId: session.user.id,
+    });
+
+    if (!access.ok) {
+      if (access.reason === "forbidden") {
+        return errorResponse(
+          403,
+          "FORBIDDEN",
+          "You do not have access to this task",
+        );
+      }
+      return errorResponse(404, "NOT_FOUND", "Task not found");
+    }
+
+    // 3. Membership gate. Public projects let non-members read tasks but
+    //    every write path (create, edit, delete) requires team membership.
+    if (!access.isMember) {
+      return errorResponse(
+        403,
+        "FORBIDDEN",
+        "Only team members can edit tasks",
+      );
+    }
+
+    // 4. Assignee membership check, only when the client is setting a
+    //    concrete user. `undefined` means "leave alone", `null` means
+    //    "unassign" — both skip this lookup.
+    if (assigneeId !== undefined && assigneeId !== null) {
+      const [assigneeMembership] = await db
+        .select({ userId: teamMemberships.userId })
+        .from(teamMemberships)
+        .where(
+          and(
+            eq(teamMemberships.teamId, access.team.id),
+            eq(teamMemberships.userId, assigneeId),
+          ),
+        )
+        .limit(1);
+
+      if (!assigneeMembership) {
+        return errorResponse(
+          422,
+          "INVALID_INPUT",
+          "Assignee must be a member of the owning team",
+        );
+      }
+    }
+
+    // 5. Apply the update. `title` is always set; `description` and
+    //    `assigneeId` are only included when explicitly present in the body
+    //    so omitting them preserves the existing value. updatedAt is bumped
+    //    via NOW() so the timestamp comes from the DB clock (consistent with
+    //    the defaultNow stamp at insert time).
+    const updatePayload: {
+      title: string;
+      updatedAt: ReturnType<typeof sql>;
+      description?: string | null;
+      assigneeId?: string | null;
+    } = {
+      title,
+      updatedAt: sql`now()`,
+    };
+    if (description !== undefined) {
+      updatePayload.description = description;
+    }
+    if (assigneeId !== undefined) {
+      updatePayload.assigneeId = assigneeId;
+    }
+
+    const [updated] = await db
+      .update(tasks)
+      .set(updatePayload)
+      .where(eq(tasks.id, taskRow.id))
+      .returning({
+        id: tasks.id,
+        columnId: tasks.columnId,
+        title: tasks.title,
+        description: tasks.description,
+        position: tasks.position,
+        assigneeId: tasks.assigneeId,
+        createdAt: tasks.createdAt,
+        updatedAt: tasks.updatedAt,
+      });
+
+    if (!updated) {
+      // We just confirmed the row exists in step 1 and don't race deletes
+      // inside this handler, but the row could in theory have been removed
+      // by a concurrent DELETE. Surface as 404 rather than 500.
+      return errorResponse(404, "NOT_FOUND", "Task not found");
+    }
+
+    // 6. Hydrate the assignee slice for the response. We do this outside
+    //    the update statement (one extra round-trip when assigned) to keep
+    //    the write tight. The membership check above already proved the
+    //    user exists, so this is a known-hit on the happy path; we still
+    //    guard against a vanishing row to avoid crashing the response.
+    let assignee: { id: string; name: string | null; email: string } | null =
+      null;
+    if (updated.assigneeId !== null) {
+      const [user] = await db
+        .select({ id: users.id, name: users.name, email: users.email })
+        .from(users)
+        .where(eq(users.id, updated.assigneeId))
+        .limit(1);
+      assignee = user
+        ? { id: user.id, name: user.name, email: user.email }
+        : null;
+    }
+
+    return NextResponse.json(
+      {
+        task: {
+          id: updated.id,
+          columnId: updated.columnId,
+          title: updated.title,
+          description: updated.description,
+          position: updated.position,
+          createdAt: updated.createdAt,
+          updatedAt: updated.updatedAt,
+          assignee,
+        },
+      },
+      { status: 200 },
+    );
+  } catch (err: unknown) {
+    console.error("[PUT /api/tasks/[taskId]] unexpected error", err);
+    return errorResponse(
+      500,
+      "INTERNAL_ERROR",
+      "Unable to update task at this time",
     );
   }
 }
