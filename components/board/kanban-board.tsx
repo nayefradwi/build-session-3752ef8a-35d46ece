@@ -18,6 +18,10 @@ import { cn } from "@/lib/client/utils";
 import { Button } from "@/components/ui/button";
 import { BoardColumn, BoardColumnSkeleton } from "@/components/board/board-column";
 import { AddColumnDialog } from "@/components/board/add-column-dialog";
+import {
+  AddTaskDialog,
+  type AddTaskTeamMember,
+} from "@/components/board/add-task-dialog";
 import type { BoardColumnData, BoardTask } from "@/components/board/types";
 
 /* -------------------------------------------------------------------------- */
@@ -82,6 +86,11 @@ type TeamRole = "admin" | "member";
 type TeamMember = {
   userId: string;
   role: TeamRole;
+  // The team-detail endpoint inlines a small profile slice on every member;
+  // we surface it here so the assignee dropdown in the "Add task" dialog
+  // can render names without an extra round-trip.
+  email: string;
+  name: string | null;
 };
 
 type TeamDetailResponse = {
@@ -135,8 +144,14 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
   const [project, setProject] = useState<Project | null>(null);
   const [isMember, setIsMember] = useState(false);
   const [isTeamAdmin, setIsTeamAdmin] = useState(false);
+  const [teamMembers, setTeamMembers] = useState<AddTaskTeamMember[]>([]);
   const [columns, setColumns] = useState<BoardColumnData[]>([]);
   const [addColumnOpen, setAddColumnOpen] = useState(false);
+  // Column the "Add task" dialog is currently targeting. `null` when the
+  // dialog is closed. Lifting this to the board (rather than per-column)
+  // keeps a single dialog instance mounted at a time so opening a different
+  // lane's "+ Add task" cleanly swaps the target without remounting.
+  const [addTaskColumnId, setAddTaskColumnId] = useState<string | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -229,6 +244,20 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
       setProject(projectData.project);
       setIsMember(projectData.isMember);
       setIsTeamAdmin(callerMembership?.role === "admin");
+      // Surface the team membership roster (id + display fields only) so the
+      // Add Task dialog can populate its assignee dropdown without re-fetch.
+      // Falls back to an empty list if the team-detail fetch failed — the
+      // dialog still renders with just the "Unassigned" option, which is the
+      // correct degraded behavior.
+      setTeamMembers(
+        teamDetail
+          ? teamDetail.members.map((m) => ({
+              userId: m.userId,
+              name: m.name,
+              email: m.email,
+            }))
+          : [],
+      );
       setColumns(hydrated);
     } catch (err) {
       if (err instanceof ApiError) {
@@ -283,6 +312,31 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
     [],
   );
 
+  // Append-on-success for tasks: the POST handler returns the inflated task
+  // (with server-assigned id, position, and the inlined assignee slice), so
+  // we splice it onto the targeted column's task list without a full board
+  // refetch. Re-sort by `position` defensively in case a sibling member
+  // slipped a concurrent insert into the same lane between fetches.
+  const handleTaskCreated = useCallback((task: BoardTask) => {
+    setColumns((prev) =>
+      prev.map((column) => {
+        if (column.id !== task.columnId) return column;
+        if (column.tasks.some((t) => t.id === task.id)) return column;
+        const tasks = [...column.tasks, task];
+        tasks.sort((a, b) => a.position - b.position);
+        return { ...column, tasks };
+      }),
+    );
+  }, []);
+
+  // Resolve the column the "Add task" dialog is targeting (lifted up so the
+  // dialog stays a single mounted instance). Memoized so the dialog props
+  // stay referentially stable across unrelated re-renders.
+  const addTaskColumn = useMemo(() => {
+    if (!addTaskColumnId) return null;
+    return columns.find((c) => c.id === addTaskColumnId) ?? null;
+  }, [addTaskColumnId, columns]);
+
   /* ------------------------------- Render -------------------------------- */
 
   if (sessionStatus === "loading" || (loading && !project && !error && !notFound && !forbidden)) {
@@ -312,6 +366,7 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
         loading={loading}
         onRefresh={() => void loadBoard()}
         onRequestAddColumn={() => setAddColumnOpen(true)}
+        onRequestAddTask={(columnId) => setAddTaskColumnId(columnId)}
       />
       {/* Mounted only when we know the projectId AND the caller is a team
           admin — the dialog needs the projectId to POST against, and the
@@ -322,6 +377,24 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
           onOpenChange={setAddColumnOpen}
           projectId={project.id}
           onCreated={handleColumnCreated}
+        />
+      ) : null}
+      {/* Mounted whenever the caller is a team member AND the project has
+          resolved — non-members would 403 on submit, and the dialog needs
+          the projectId in its POST. We unmount on dialog-close (rather than
+          hide) so transient form state resets cleanly without a custom
+          effect. */}
+      {isMember && project && addTaskColumn ? (
+        <AddTaskDialog
+          open={Boolean(addTaskColumn)}
+          onOpenChange={(next) => {
+            if (!next) setAddTaskColumnId(null);
+          }}
+          projectId={project.id}
+          columnId={addTaskColumn.id}
+          columnName={addTaskColumn.name}
+          members={teamMembers}
+          onCreated={handleTaskCreated}
         />
       ) : null}
     </>
@@ -341,6 +414,7 @@ type BoardLayoutProps = {
   loading: boolean;
   onRefresh: () => void;
   onRequestAddColumn: () => void;
+  onRequestAddTask: (columnId: string) => void;
 };
 
 function BoardLayout({
@@ -352,6 +426,7 @@ function BoardLayout({
   loading,
   onRefresh,
   onRequestAddColumn,
+  onRequestAddTask,
 }: BoardLayoutProps) {
   const totalTasks = useMemo(
     () => columns.reduce((sum, col) => sum + col.tasks.length, 0),
@@ -409,6 +484,7 @@ function BoardLayout({
         isMember={isMember}
         isTeamAdmin={isTeamAdmin}
         onRequestAddColumn={onRequestAddColumn}
+        onRequestAddTask={onRequestAddTask}
       />
     </div>
   );
@@ -423,6 +499,7 @@ type BoardColumnsProps = {
   isMember: boolean;
   isTeamAdmin: boolean;
   onRequestAddColumn: () => void;
+  onRequestAddTask: (columnId: string) => void;
 };
 
 function BoardColumns({
@@ -430,6 +507,7 @@ function BoardColumns({
   isMember,
   isTeamAdmin,
   onRequestAddColumn,
+  onRequestAddTask,
 }: BoardColumnsProps) {
   if (columns.length === 0) {
     return (
@@ -461,7 +539,16 @@ function BoardColumns({
     >
       <div className="flex gap-4 px-4 sm:gap-5 sm:px-6">
         {columns.map((column) => (
-          <BoardColumn key={column.id} column={column} />
+          <BoardColumn
+            key={column.id}
+            column={column}
+            // Team-member gate: only members can append tasks (the server
+            // 403s non-members regardless of project visibility). Hiding the
+            // affordance keeps the read-only experience clean for visitors
+            // on a public project.
+            canAddTask={isMember}
+            onRequestAddTask={() => onRequestAddTask(column.id)}
+          />
         ))}
         {canAddColumn ? (
           <AddColumnTrigger onClick={onRequestAddColumn} />

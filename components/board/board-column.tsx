@@ -1,7 +1,8 @@
 "use client";
 
-import { Layers } from "lucide-react";
+import { Layers, Plus } from "lucide-react";
 
+import { cn } from "@/lib/client/utils";
 import { BoardTaskCard } from "@/components/board/board-task-card";
 import type { BoardColumnData } from "@/components/board/types";
 
@@ -11,6 +12,20 @@ import type { BoardColumnData } from "@/components/board/types";
 
 type BoardColumnProps = {
   column: BoardColumnData;
+  /**
+   * When true, the column renders an "+ Add task" affordance pinned at the
+   * bottom of the lane. Gated to team members only — non-members would 403
+   * on submit, so the affordance is hidden to keep the read-only experience
+   * clean. Defaults to false so the existing skeleton-only callsite stays
+   * unaffected.
+   */
+  canAddTask?: boolean;
+  /**
+   * Click handler for the "+ Add task" affordance. The parent owns the
+   * dialog state (single mounted instance shared across columns), so the
+   * column just signals "open the dialog targeting me".
+   */
+  onRequestAddTask?: () => void;
 };
 
 /**
@@ -25,7 +40,11 @@ type BoardColumnProps = {
  *   - Header shows the column name + a small task count badge so an at-a-
  *     glance "how loaded is this lane" read is one eye-flick away.
  */
-export function BoardColumn({ column }: BoardColumnProps) {
+export function BoardColumn({
+  column,
+  canAddTask = false,
+  onRequestAddTask,
+}: BoardColumnProps) {
   const taskCount = column.tasks.length;
 
   return (
@@ -58,7 +77,49 @@ export function BoardColumn({ column }: BoardColumnProps) {
           ))
         )}
       </ol>
+
+      {canAddTask && onRequestAddTask ? (
+        <AddTaskTrigger
+          onClick={onRequestAddTask}
+          columnName={column.name}
+        />
+      ) : null}
     </section>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              Add task trigger                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * "+ Add task" affordance pinned at the bottom of the column. Visually
+ * subdued (dashed border, muted background) so it doesn't compete with the
+ * real task cards above it, but full-width and a single click target so it
+ * reads as the natural next step on an empty or short lane.
+ */
+function AddTaskTrigger({
+  onClick,
+  columnName,
+}: {
+  onClick: () => void;
+  columnName: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={`Add task to ${columnName}`}
+      className={cn(
+        "flex w-full items-center justify-center gap-1.5",
+        "rounded-md border border-dashed bg-background/40 px-3 py-2 text-xs font-medium text-muted-foreground",
+        "transition-colors hover:border-foreground/40 hover:bg-background/80 hover:text-foreground",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ring-offset-background",
+      )}
+    >
+      <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+      <span>Add task</span>
+    </button>
   );
 }
 
