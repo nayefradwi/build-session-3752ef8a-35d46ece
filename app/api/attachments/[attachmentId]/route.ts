@@ -1,5 +1,5 @@
 import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
+import { stat, unlink } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
 
@@ -20,7 +20,7 @@ import { getUploadDir } from "@/lib/server/uploads";
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-type AttachmentDownloadErrorCode =
+type AttachmentErrorCode =
   | "INVALID_INPUT"
   | "UNAUTHENTICATED"
   | "FORBIDDEN"
@@ -29,7 +29,7 @@ type AttachmentDownloadErrorCode =
 
 const errorResponse = (
   status: number,
-  code: AttachmentDownloadErrorCode,
+  code: AttachmentErrorCode,
   message: string,
 ): NextResponse =>
   NextResponse.json({ error: message, code }, { status });
@@ -295,6 +295,202 @@ export async function GET(
       500,
       "INTERNAL_ERROR",
       "Unable to download attachment at this time",
+    );
+  }
+}
+
+/**
+ * DELETE /api/attachments/[attachmentId]
+ *
+ * Permanently delete an attachment: drop the on-disk file and the matching
+ * `attachments` row. On success returns 204 No Content with an empty body —
+ * the resource is gone and there's no representation to echo back.
+ *
+ * Authorization (mirrors the task write endpoints + the upload POST):
+ *   - Caller must be authenticated (401 UNAUTHENTICATED).
+ *   - The attachment's owning project must live in the caller's tenant.
+ *     Cross-tenant or non-existent attachment ids collapse to 404 to avoid
+ *     leaking existence across tenant boundaries.
+ *   - Caller must be a *team member* of the owning team. Public-project
+ *     visibility lets non-members read/download attachments, but every write
+ *     path — including delete — requires team membership; non-members get 403.
+ *     This is the "team member access" rule from the task spec.
+ *
+ * Atomicity:
+ *   - The DB row delete runs inside `db.transaction(...)` with `FOR UPDATE`
+ *     on the attachment row, so a concurrent DELETE of the same row collapses
+ *     to a single winner; the loser sees "row gone under the lock" and 404s
+ *     cleanly instead of double-unlinking.
+ *   - Order: row delete first, then `unlink` after commit. If the unlink
+ *     fails (or the file was already gone) the DB row is still removed —
+ *     leaving an orphaned byte stream is strictly preferable to a dangling
+ *     row that points at nothing. We log the orphan for operators.
+ *
+ * Filesystem semantics:
+ *   - Missing file (`ENOENT`) is NOT an error: the spec explicitly requires
+ *     graceful handling of "file gone but row present" (e.g. an out-of-band
+ *     wipe), so we still drop the row and return 204.
+ *   - A storage path that escapes UPLOAD_DIR via `..` is treated as an
+ *     inconsistency: we skip the unlink (rather than risk deleting a host
+ *     file by following a tampered path) but still drop the DB row so the
+ *     bad reference can't keep poisoning future requests.
+ *
+ * Failure cases:
+ *   - 400 INVALID_INPUT — `attachmentId` is not a UUID.
+ *   - 401 UNAUTHENTICATED — no session.
+ *   - 403 FORBIDDEN — caller is not a team member of the owning team.
+ *   - 404 NOT_FOUND — row missing or cross-tenant.
+ *   - 500 INTERNAL_ERROR — anything else.
+ */
+export async function DELETE(
+  _request: Request,
+  context: { params: Promise<{ attachmentId: string }> },
+): Promise<NextResponse> {
+  const session = await auth();
+  if (!session?.user?.id || !session.user.tenantId) {
+    return errorResponse(401, "UNAUTHENTICATED", "Sign in to continue");
+  }
+
+  const { attachmentId: rawAttachmentId } = await context.params;
+  const attachmentIdParse = attachmentIdParamSchema.safeParse(rawAttachmentId);
+  if (!attachmentIdParse.success) {
+    return errorResponse(400, "INVALID_INPUT", "Invalid attachment id");
+  }
+  const attachmentId = attachmentIdParse.data;
+
+  try {
+    // 1. Locate the attachment + the owning project (via task → column FK)
+    //    in one round-trip. Tenant + visibility are enforced separately by
+    //    the access helper below — keeping this query scoped only to the
+    //    attachment id mirrors the GET handler and means a cross-tenant id
+    //    flows through to step 2 and collapses to 404 there.
+    const [row] = await db
+      .select({
+        id: attachments.id,
+        storagePath: attachments.storagePath,
+        projectId: columns.projectId,
+      })
+      .from(attachments)
+      .innerJoin(tasks, eq(tasks.id, attachments.taskId))
+      .innerJoin(columns, eq(columns.id, tasks.columnId))
+      .where(eq(attachments.id, attachmentId))
+      .limit(1);
+
+    if (!row) {
+      return errorResponse(404, "NOT_FOUND", "Attachment not found");
+    }
+
+    // 2. Tenant + visibility gate. Cross-tenant => 404, private + non-member
+    //    => 403, public OR member => continue. Reusing the helper keeps the
+    //    policy in exactly one place.
+    const access = await resolveProjectAccessByProjectId({
+      projectId: row.projectId,
+      tenantId: session.user.tenantId,
+      userId: session.user.id,
+    });
+
+    if (!access.ok) {
+      if (access.reason === "forbidden") {
+        return errorResponse(
+          403,
+          "FORBIDDEN",
+          "You do not have access to this attachment",
+        );
+      }
+      return errorResponse(404, "NOT_FOUND", "Attachment not found");
+    }
+
+    // 3. Membership gate. Public projects let non-members download (GET) but
+    //    deletion is a write — gate strictly on team membership, matching
+    //    the upload POST and every other task-write surface.
+    if (!access.isMember) {
+      return errorResponse(
+        403,
+        "FORBIDDEN",
+        "Only team members can delete attachments",
+      );
+    }
+
+    // 4. Resolve the on-disk path BEFORE the tx so we know which bytes to
+    //    drop after the row is gone. The containment check defends against a
+    //    tampered storagePath escaping UPLOAD_DIR via "..". If containment
+    //    fails we still proceed with the DB delete (the row's reference is
+    //    bad either way — leaving the row would just keep the bad pointer
+    //    around) but we skip the unlink so we don't follow the bogus path.
+    const resolved = resolveStoragePath(row.storagePath);
+    if (!resolved.ok) {
+      console.error(
+        "[DELETE /api/attachments/[attachmentId]] storage path escapes UPLOAD_DIR; deleting row only",
+        { attachmentId, storagePath: row.storagePath },
+      );
+    }
+
+    // 5. Atomic row delete. FOR UPDATE on the attachment row serializes
+    //    concurrent DELETE / GET writers; the loser of a DELETE-vs-DELETE
+    //    race observes the row gone and 404s.
+    const result = await db.transaction(async (tx) => {
+      const [locked] = await tx
+        .select({ id: attachments.id })
+        .from(attachments)
+        .where(eq(attachments.id, attachmentId))
+        .for("update");
+
+      if (!locked) {
+        return { kind: "not_found" as const };
+      }
+
+      await tx.delete(attachments).where(eq(attachments.id, locked.id));
+      return { kind: "ok" as const };
+    });
+
+    if (result.kind === "not_found") {
+      return errorResponse(404, "NOT_FOUND", "Attachment not found");
+    }
+
+    // 6. Best-effort filesystem cleanup AFTER commit. Order matters: if we
+    //    unlinked first and the row delete failed, we'd have a row pointing
+    //    at nothing. Doing it after commit means the worst case is an orphan
+    //    file, which an operator can sweep — strictly preferable to a
+    //    dangling DB reference.
+    //
+    //    ENOENT (file already gone) is NOT an error: the spec requires this
+    //    branch to still succeed with 204. Anything else gets logged for
+    //    operator follow-up but does NOT fail the request — the row is gone,
+    //    which is the user-visible outcome they asked for.
+    if (resolved.ok) {
+      try {
+        await unlink(resolved.absolutePath);
+      } catch (unlinkErr: unknown) {
+        const code =
+          unlinkErr instanceof Error && "code" in unlinkErr
+            ? (unlinkErr as NodeJS.ErrnoException).code
+            : undefined;
+        if (code !== "ENOENT") {
+          console.error(
+            "[DELETE /api/attachments/[attachmentId]] failed to unlink file after row delete",
+            {
+              attachmentId,
+              absolutePath: resolved.absolutePath,
+              unlinkErr,
+            },
+          );
+        }
+      }
+    }
+
+    // 204 No Content: the resource is gone and there's no representation to
+    // return. Body MUST be empty per the HTTP spec — `new NextResponse(null,
+    // ...)` is the right shape (json() would emit "null" as a body).
+    return new NextResponse(null, { status: 204 });
+  } catch (err: unknown) {
+    console.error(
+      "[DELETE /api/attachments/[attachmentId]] unexpected error",
+      err,
+    );
+    return errorResponse(
+      500,
+      "INTERNAL_ERROR",
+      "Unable to delete attachment at this time",
     );
   }
 }
