@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import {
   useCallback,
   useEffect,
@@ -17,8 +18,8 @@ import { cn } from "@/lib/client/utils";
 import { Button } from "@/components/ui/button";
 import {
   Card,
-  CardContent,
   CardDescription,
+  CardFooter,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
@@ -135,53 +136,53 @@ export function TeamsManager() {
     [loadTeams],
   );
 
+  const sessionLoading = status === "loading";
+  const showCount = !sessionLoading && !listError && teams.length > 0;
+
   return (
     <div className="space-y-6">
-      <Card>
-        <CardHeader className="flex flex-row items-start justify-between gap-3 space-y-0">
-          <div className="space-y-1.5">
-            <CardTitle className="text-xl">Teams in your workspace</CardTitle>
-            <CardDescription>
-              Browse every team in your tenant. Each team has its own private
-              project board.
-            </CardDescription>
-          </div>
-          <div className="flex items-center gap-2">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <p className="text-sm text-muted-foreground" aria-live="polite">
+          {showCount
+            ? `${teams.length} ${teams.length === 1 ? "team" : "teams"} in your workspace.`
+            : "Browse every team in your tenant. Each team has its own private project board."}
+        </p>
+        <div className="flex items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => void loadTeams()}
+            disabled={listLoading}
+            aria-label="Refresh teams"
+          >
+            <RefreshCw
+              className={cn("h-4 w-4", listLoading && "animate-spin")}
+              aria-hidden="true"
+            />
+            <span>Refresh</span>
+          </Button>
+          {isAdmin ? (
             <Button
               type="button"
-              variant="outline"
               size="sm"
-              onClick={() => void loadTeams()}
-              disabled={listLoading}
-              aria-label="Refresh teams"
+              onClick={() => setDialogOpen(true)}
             >
-              <RefreshCw
-                className={cn("h-4 w-4", listLoading && "animate-spin")}
-                aria-hidden="true"
-              />
-              <span>Refresh</span>
+              <Plus className="h-4 w-4" aria-hidden="true" />
+              <span>Create team</span>
             </Button>
-            {isAdmin ? (
-              <Button
-                type="button"
-                size="sm"
-                onClick={() => setDialogOpen(true)}
-              >
-                <Plus className="h-4 w-4" aria-hidden="true" />
-                <span>Create team</span>
-              </Button>
-            ) : null}
-          </div>
-        </CardHeader>
-        <CardContent>
-          <TeamsList
-            teams={teams}
-            loading={listLoading}
-            error={listError}
-            sessionLoading={status === "loading"}
-          />
-        </CardContent>
-      </Card>
+          ) : null}
+        </div>
+      </div>
+
+      <TeamsList
+        teams={teams}
+        loading={listLoading}
+        error={listError}
+        sessionLoading={sessionLoading}
+        isAdmin={isAdmin}
+        onCreateClick={() => setDialogOpen(true)}
+      />
 
       {/* Mounted unconditionally on admin so React keeps the dialog state
           stable across re-renders; non-admins never see the trigger so the
@@ -206,12 +207,25 @@ type TeamsListProps = {
   loading: boolean;
   error: string | null;
   sessionLoading: boolean;
+  isAdmin: boolean;
+  onCreateClick: () => void;
 };
 
-function TeamsList({ teams, loading, error, sessionLoading }: TeamsListProps) {
+function TeamsList({
+  teams,
+  loading,
+  error,
+  sessionLoading,
+  isAdmin,
+  onCreateClick,
+}: TeamsListProps) {
   if (sessionLoading || (loading && teams.length === 0)) {
     return (
-      <div className="flex items-center gap-3 py-6 text-muted-foreground">
+      <div
+        className="flex items-center gap-3 rounded-lg border bg-background px-6 py-10 text-muted-foreground"
+        role="status"
+        aria-live="polite"
+      >
         <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
         <span>Loading teams…</span>
       </div>
@@ -222,7 +236,7 @@ function TeamsList({ teams, loading, error, sessionLoading }: TeamsListProps) {
     return (
       <div
         role="alert"
-        className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        className="rounded-md border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive"
       >
         {error}
       </div>
@@ -230,41 +244,103 @@ function TeamsList({ teams, loading, error, sessionLoading }: TeamsListProps) {
   }
 
   if (teams.length === 0) {
-    return (
-      <div className="flex flex-col items-start gap-2 py-6 text-sm text-muted-foreground">
-        <Users
-          className="h-5 w-5 text-muted-foreground/70"
-          aria-hidden="true"
-        />
-        <p>No teams yet. Admins can create the first one above.</p>
-      </div>
-    );
+    return <TeamsEmptyState isAdmin={isAdmin} onCreateClick={onCreateClick} />;
   }
 
   return (
-    <ul className="divide-y divide-border rounded-md border">
+    <ul
+      className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3"
+      role="list"
+    >
       {teams.map((team) => (
-        <li
-          key={team.id}
-          className="flex flex-col gap-1 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
-        >
-          <div className="min-w-0">
-            <p className="truncate text-sm font-medium">{team.name}</p>
-            <p className="text-xs text-muted-foreground">
-              {team.memberCount === 1
-                ? "1 member"
-                : `${team.memberCount} members`}
-              {team.isMember ? " · You're a member" : ""}
-            </p>
-          </div>
-          {team.isMember ? (
-            <span className="inline-flex w-fit items-center rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:text-emerald-400">
-              Member
-            </span>
-          ) : null}
+        <li key={team.id} className="h-full">
+          <TeamCard team={team} />
         </li>
       ))}
     </ul>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                Team card                                   */
+/* -------------------------------------------------------------------------- */
+
+type TeamCardProps = {
+  team: TeamListItem;
+};
+
+/**
+ * Single team tile. Wrapped in a `next/link` so the entire card is clickable
+ * (including keyboard nav). The card itself stays a plain `<div>` — the
+ * outer anchor handles focus/hover affordances.
+ */
+function TeamCard({ team }: TeamCardProps) {
+  const memberLabel =
+    team.memberCount === 1 ? "1 member" : `${team.memberCount} members`;
+
+  return (
+    <Link
+      href={`/dashboard/teams/${team.id}`}
+      aria-label={`Open ${team.name} (${memberLabel}${team.isMember ? ", you are a member" : ""})`}
+      className="group block h-full rounded-lg outline-none ring-offset-2 ring-offset-background transition-shadow focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      <Card className="h-full transition-colors group-hover:border-foreground/30 group-hover:shadow-md">
+        <CardHeader className="space-y-2">
+          <div className="flex items-start justify-between gap-3">
+            <CardTitle className="truncate text-lg leading-snug">
+              {team.name}
+            </CardTitle>
+            {team.isMember ? (
+              <span className="inline-flex shrink-0 items-center rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:text-emerald-400">
+                Member
+              </span>
+            ) : null}
+          </div>
+          <CardDescription className="flex items-center gap-1.5">
+            <Users className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>{memberLabel}</span>
+          </CardDescription>
+        </CardHeader>
+      </Card>
+    </Link>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              Empty state                                   */
+/* -------------------------------------------------------------------------- */
+
+type TeamsEmptyStateProps = {
+  isAdmin: boolean;
+  onCreateClick: () => void;
+};
+
+function TeamsEmptyState({ isAdmin, onCreateClick }: TeamsEmptyStateProps) {
+  return (
+    <Card className="border-dashed">
+      <CardHeader className="items-center text-center">
+        <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-muted">
+          <Users
+            className="h-6 w-6 text-muted-foreground"
+            aria-hidden="true"
+          />
+        </div>
+        <CardTitle className="text-xl">No teams yet</CardTitle>
+        <CardDescription className="max-w-md">
+          {isAdmin
+            ? "Create the first team to spin up a private project board and start grouping your members."
+            : "Your workspace doesn't have any teams yet. Ask a tenant admin to create one to get started."}
+        </CardDescription>
+      </CardHeader>
+      {isAdmin ? (
+        <CardFooter className="justify-center pt-0">
+          <Button type="button" onClick={onCreateClick}>
+            <Plus className="h-4 w-4" aria-hidden="true" />
+            Create team
+          </Button>
+        </CardFooter>
+      ) : null}
+    </Card>
   );
 }
 
