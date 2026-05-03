@@ -40,6 +40,29 @@ type SortableBoardColumnProps = {
     name: string;
     position: number;
   }) => void;
+  /**
+   * When true, the column header renders a hover-revealed delete button
+   * gated by an AlertDialog confirmation. Mirrors the team-admin gate
+   * enforced by `DELETE /api/projects/[projectId]/columns/[columnId]` —
+   * forwarded straight through to {@link BoardColumn} without any
+   * sortable-specific wiring.
+   */
+  canDelete?: boolean;
+  /**
+   * When true, the delete button is rendered but disabled. Driven from the
+   * parent's column count: a project must always have at least one column,
+   * so the affordance is grayed out when only one lane remains. The server
+   * still enforces the same invariant (422 LAST_COLUMN), but the disabled
+   * affordance keeps the admin from even attempting a guaranteed-fail
+   * round-trip.
+   */
+  disableDelete?: boolean;
+  /**
+   * Splice-on-success callback for a confirmed column delete. Forwarded
+   * straight to {@link BoardColumn}; the parent uses it to drop the column
+   * from local board state without a full refetch.
+   */
+  onDeleted?: (columnId: string) => void;
 };
 
 /**
@@ -80,6 +103,9 @@ export function SortableBoardColumn({
   canEditName,
   projectId,
   onRenamed,
+  canDelete,
+  disableDelete,
+  onDeleted,
 }: SortableBoardColumnProps) {
   const {
     attributes,
@@ -112,6 +138,9 @@ export function SortableBoardColumn({
         projectId={projectId}
         onRenamed={onRenamed}
         isDragging={isDragging}
+        canDelete={canDelete}
+        disableDelete={disableDelete}
+        onDeleted={onDeleted}
         dragHandleProps={
           canReorderColumns
             ? {

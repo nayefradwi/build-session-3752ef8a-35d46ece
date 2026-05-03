@@ -445,6 +445,19 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
     });
   }, []);
 
+  // Splice-on-success for column deletes: the DELETE handler returns 204
+  // (or 404 if a peer admin already removed the same row, which the column
+  // affordance treats as a successful no-op), so the trigger hands us only
+  // the deleted column's id. We drop the column from local state without a
+  // full refetch and a no-op pass through `prev` is returned when nothing
+  // changes so React skips the re-render.
+  const handleColumnDeleted = useCallback((columnId: string) => {
+    setColumns((prev) => {
+      const next = prev.filter((c) => c.id !== columnId);
+      return next.length === prev.length ? prev : next;
+    });
+  }, []);
+
   // Sync-on-success for inline column renames. The PUT handler returns the
   // freshly-updated column row (id/projectId/name/position); we swap it onto
   // local state by id, preserving the existing `tasks` slice. Position can
@@ -963,6 +976,7 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
           onRequestAddTask={(columnId) => setAddTaskColumnId(columnId)}
           onSelectTask={(task) => setDetailTaskId(task.id)}
           onColumnRenamed={handleColumnRenamed}
+          onColumnDeleted={handleColumnDeleted}
         />
         {/* The DragOverlay clone follows the cursor while a drag is in
             progress. For a task drag we render a non-interactive
@@ -1063,6 +1077,7 @@ type BoardLayoutProps = {
     name: string;
     position: number;
   }) => void;
+  onColumnDeleted: (columnId: string) => void;
 };
 
 function BoardLayout({
@@ -1077,6 +1092,7 @@ function BoardLayout({
   onRequestAddTask,
   onSelectTask,
   onColumnRenamed,
+  onColumnDeleted,
 }: BoardLayoutProps) {
   // The drag-to-reorder gesture mirrors the server-side member check on
   // PATCH /api/tasks/[taskId]/move. Visitors of a public project can still
@@ -1143,6 +1159,7 @@ function BoardLayout({
         onSelectTask={onSelectTask}
         canReorder={canReorder}
         onColumnRenamed={onColumnRenamed}
+        onColumnDeleted={onColumnDeleted}
       />
     </div>
   );
@@ -1178,6 +1195,7 @@ type BoardColumnsProps = {
     name: string;
     position: number;
   }) => void;
+  onColumnDeleted: (columnId: string) => void;
 };
 
 function BoardColumns({
@@ -1190,6 +1208,7 @@ function BoardColumns({
   onSelectTask,
   canReorder,
   onColumnRenamed,
+  onColumnDeleted,
 }: BoardColumnsProps) {
   // Memoize the sortable item ids — `SortableContext` re-registers items on
   // every prop identity change, and the parent re-renders this subtree
@@ -1214,6 +1233,13 @@ function BoardColumns({
   // limit (concurrent inserts could push us over the threshold between
   // renders), but this keeps the happy-path UI clean.
   const canAddColumn = isTeamAdmin && columns.length < 10;
+
+  // Min-columns invariant for the per-column delete affordance: a project
+  // must always have at least one column (server returns 422 LAST_COLUMN
+  // otherwise), so we disable the delete button when only one lane remains.
+  // The flag flips back on as soon as a second column is added — no extra
+  // refetch needed because `columns` is the optimistic source of truth.
+  const onlyOneColumn = columns.length <= 1;
 
   return (
     // The board lives inside the dashboard's max-w-6xl container; we break
@@ -1268,6 +1294,15 @@ function BoardColumns({
               canEditName={isTeamAdmin}
               projectId={projectId ?? undefined}
               onRenamed={onColumnRenamed}
+              // Delete affordance is admin-only — same gate as rename, and
+              // the server-side DELETE handler enforces team-admin too. We
+              // also disable (rather than hide) the button when only one
+              // column remains so the admin understands *why* they can't
+              // delete; the server returns 422 LAST_COLUMN as a backstop
+              // for the racing-peer case where columns.length is stale.
+              canDelete={isTeamAdmin}
+              disableDelete={onlyOneColumn}
+              onDeleted={onColumnDeleted}
             />
           ))}
         </SortableContext>

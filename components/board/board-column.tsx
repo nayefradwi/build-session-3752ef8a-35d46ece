@@ -5,13 +5,31 @@ import {
   SortableContext,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
-import { GripVertical, Layers, Pencil, Plus } from "lucide-react";
+import {
+  GripVertical,
+  Layers,
+  Loader2,
+  Pencil,
+  Plus,
+  Trash2,
+} from "lucide-react";
 import type { HTMLAttributes, Ref } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { ApiError, apiClient } from "@/lib/client/api-client";
 import { cn } from "@/lib/client/utils";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { buttonVariants } from "@/components/ui/button";
 import { BoardTaskCard } from "@/components/board/board-task-card";
 import { SortableBoardTaskCard } from "@/components/board/sortable-task-card";
 import type { BoardColumnData, BoardTask } from "@/components/board/types";
@@ -112,6 +130,32 @@ type BoardColumnProps = {
    * the cursor.
    */
   isDragging?: boolean;
+  /**
+   * When true, renders a hover-revealed trash icon in the column header
+   * that opens an AlertDialog confirming deletion. Mirrors the server-side
+   * team-admin gate enforced by
+   * `DELETE /api/projects/[projectId]/columns/[columnId]`. Tenant admins do
+   * NOT bypass; column management is team-scoped, just like rename and
+   * reorder. Hidden entirely for non-admins so the read-only column header
+   * stays chrome-free.
+   */
+  canDelete?: boolean;
+  /**
+   * When true, the delete button is disabled (rendered but not clickable).
+   * Used by the parent to enforce the "you can't delete the only column"
+   * UX guard — the server enforces the same invariant via a 422 LAST_COLUMN
+   * response, but disabling the button up front means the admin can't even
+   * try, which is friendlier than a confirm-then-toast cycle.
+   */
+  disableDelete?: boolean;
+  /**
+   * Splice-on-success callback for a confirmed delete. Fired with the
+   * deleted column's id once the DELETE round-trips successfully (or 404s
+   * — a 404 means a peer admin already deleted the same column, which we
+   * treat as success so the local board state catches up). The parent uses
+   * this to drop the column from `columns` without a full refetch.
+   */
+  onDeleted?: (columnId: string) => void;
 };
 
 /**
@@ -137,6 +181,9 @@ export function BoardColumn({
   onRenamed,
   dragHandleProps,
   isDragging = false,
+  canDelete = false,
+  disableDelete = false,
+  onDeleted,
 }: BoardColumnProps) {
   const taskCount = column.tasks.length;
 
@@ -178,6 +225,12 @@ export function BoardColumn({
         taskCount === 1 ? "task" : "tasks"
       }`}
       className={cn(
+        // `group/column` lets descendants opt into "appears on column hover"
+        // affordances (the delete trash icon, in particular) without
+        // bleeding hover state from sibling columns. Keyboard users can
+        // reach the same affordance via tab focus — `focus-within` keeps the
+        // button visible while it (or any nested control) is focused.
+        "group/column",
         "flex w-64 shrink-0 flex-col gap-3 rounded-lg border bg-muted/40 p-3 md:w-72 lg:w-80",
         "transition-colors",
         canReorder && activeFromOtherColumn && "border-primary/40 bg-muted/70",
@@ -206,12 +259,23 @@ export function BoardColumn({
             onRenamed={onRenamed}
           />
         </div>
-        <span
-          className="inline-flex h-5 min-w-[1.25rem] shrink-0 items-center justify-center rounded-full bg-background px-1.5 text-xs font-medium text-muted-foreground"
-          aria-hidden="true"
-        >
-          {taskCount}
-        </span>
+        <div className="flex shrink-0 items-center gap-1">
+          <span
+            className="inline-flex h-5 min-w-[1.25rem] shrink-0 items-center justify-center rounded-full bg-background px-1.5 text-xs font-medium text-muted-foreground"
+            aria-hidden="true"
+          >
+            {taskCount}
+          </span>
+          {canDelete && projectId ? (
+            <ColumnDeleteAffordance
+              column={column}
+              projectId={projectId}
+              taskCount={taskCount}
+              disabled={disableDelete}
+              onDeleted={onDeleted}
+            />
+          ) : null}
+        </div>
       </header>
 
       <SortableContext items={taskIds} strategy={verticalListSortingStrategy}>
@@ -533,6 +597,247 @@ function ColumnHeaderTitle({
         aria-hidden="true"
       />
     </button>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                          Column delete affordance                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Structured 422 body the column DELETE handler returns when a product
+ * invariant blocks the request. We pull these off the thrown
+ * {@link ApiError}'s `data` so we can surface contextual messaging instead of
+ * the generic toast — the server's `message` is already human-readable but
+ * the discriminator (`error`) lets us pluralize / theme per case.
+ *
+ *   - `LAST_COLUMN`: returned when the project would be left with zero
+ *     columns. We pre-empt this UX with `disableDelete` (driven from the
+ *     parent's column-count), but the server is authoritative — a peer
+ *     admin's racing delete could land between renders, so we still handle
+ *     the 422 cleanly.
+ *   - `COLUMN_HAS_TASKS`: returned when the column still has at least one
+ *     task. The body inlines `taskCount` so we can pluralize the toast
+ *     ("column has 3 tasks") without a follow-up GET.
+ */
+type ColumnDeleteErrorBody =
+  | { error: "LAST_COLUMN"; message?: string }
+  | { error: "COLUMN_HAS_TASKS"; message?: string; taskCount?: number };
+
+function isColumnDeleteErrorBody(
+  data: unknown,
+): data is ColumnDeleteErrorBody {
+  if (!data || typeof data !== "object") return false;
+  const maybe = data as { error?: unknown };
+  return maybe.error === "LAST_COLUMN" || maybe.error === "COLUMN_HAS_TASKS";
+}
+
+/**
+ * Hover-revealed trash button + confirm-and-delete AlertDialog for a single
+ * kanban column.
+ *
+ * Hover reveal:
+ *   - The button is rendered at full size but `opacity-0` by default. The
+ *     parent `<section>` carries a `group/column` class so the button fades
+ *     in only when the user hovers / focuses *this* column. Keyboard users
+ *     reach it via tab order — `group-focus-within` keeps it visible while
+ *     focused, and the AlertDialog opens on Enter/Space like any button.
+ *   - Touch devices have no hover, so we also reveal the button when the
+ *     `aria-expanded` flips on (open state) — though in practice a tap on
+ *     mobile triggers the focus state too, so the button is reachable.
+ *
+ * Confirm flow:
+ *   - Clicking the trash button opens an AlertDialog warning that any tasks
+ *     in the column must be moved first. We don't block the open on
+ *     `taskCount > 0` client-side because the server's structured 422
+ *     remains authoritative (a peer could have moved/created tasks between
+ *     renders), and the warning copy is the same either way.
+ *   - The Action button stays mounted while the DELETE is in flight; we
+ *     `event.preventDefault()` Radix's default close-on-action so we can
+ *     keep the dialog open through the round-trip and reflect errors
+ *     in-place rather than stranding the user with a toast on a bare board.
+ *
+ * Error mapping:
+ *   - 422 LAST_COLUMN → "Couldn't delete column" toast with the server's
+ *     message. The button is also disabled when `disableDelete` is true, so
+ *     hitting this branch normally means a peer admin's delete raced ahead.
+ *   - 422 COLUMN_HAS_TASKS → toast with "Cannot delete: column has N task(s)"
+ *     so the admin gets a clear nudge to move tasks first. We prefer the
+ *     server's `taskCount` over the local `column.tasks.length` because the
+ *     local count may be stale (a peer member could have just created a
+ *     task between fetches).
+ *   - 404 → treat as success: the column is already gone. We forward the
+ *     id so the parent can prune local state and stop showing a stale lane.
+ *   - Any other status / network error → generic "Couldn't delete column"
+ *     toast with the parsed message.
+ */
+function ColumnDeleteAffordance({
+  column,
+  projectId,
+  taskCount,
+  disabled,
+  onDeleted,
+}: {
+  column: BoardColumnData;
+  projectId: string;
+  taskCount: number;
+  disabled: boolean;
+  onDeleted?: (columnId: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
+  const handleConfirmDelete = async () => {
+    if (deleting) return;
+    setDeleting(true);
+    try {
+      await apiClient.delete(
+        `/api/projects/${projectId}/columns/${column.id}`,
+        { silent: true, skipAuthRedirect: false },
+      );
+      toast.success("Column deleted", {
+        description: `“${column.name}” has been removed.`,
+      });
+      onDeleted?.(column.id);
+      setOpen(false);
+    } catch (err) {
+      if (err instanceof ApiError) {
+        // Structured 422 invariants from the column DELETE handler. We
+        // pull the discriminator off `err.data` so the toast can carry
+        // task-blocking copy distinct from last-column copy. `err.message`
+        // has already been populated from the server's `message` field by
+        // the api-client's extractor, but we fall back defensively in
+        // case a future server change drops the `message` key.
+        if (err.status === 422 && isColumnDeleteErrorBody(err.data)) {
+          if (err.data.error === "COLUMN_HAS_TASKS") {
+            const blocked = err.data.taskCount ?? taskCount;
+            const description =
+              err.data.message ??
+              `Cannot delete: column has ${blocked} ${
+                blocked === 1 ? "task" : "tasks"
+              }. Move them first.`;
+            toast.error("Couldn't delete column", { description });
+          } else {
+            // LAST_COLUMN. The button should already be disabled when this
+            // is the only column, so this branch normally only fires when a
+            // peer admin's racing delete has emptied the project under us.
+            const description =
+              err.data.message ??
+              "A project must always have at least one column.";
+            toast.error("Couldn't delete column", { description });
+          }
+          // Keep the AlertDialog open so the admin sees the cause without
+          // losing context — they can Cancel out (or move tasks first and
+          // retry without re-opening the trigger).
+          return;
+        }
+        if (err.status === 404) {
+          // Already gone. Treat as a successful no-op so the local board
+          // catches up. A peer admin likely deleted the same column.
+          toast.success("Column deleted", {
+            description: "This column was already removed.",
+          });
+          onDeleted?.(column.id);
+          setOpen(false);
+          return;
+        }
+        toast.error("Couldn't delete column", { description: err.message });
+      } else {
+        toast.error("Couldn't delete column", {
+          description: "Something went wrong. Please try again.",
+        });
+      }
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => {
+          if (disabled || deleting) return;
+          setOpen(true);
+        }}
+        disabled={disabled || deleting}
+        aria-label={
+          disabled
+            ? `Delete ${column.name} column (disabled — last column)`
+            : `Delete ${column.name} column`
+        }
+        title={
+          disabled
+            ? "A project must have at least one column"
+            : `Delete ${column.name}`
+        }
+        className={cn(
+          "flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground/70",
+          "transition-opacity",
+          // Hidden by default; revealed on column hover or when any control
+          // inside the column receives focus. Always visible while the
+          // confirm dialog is open so the trigger doesn't disappear under
+          // the user's cursor.
+          "opacity-0 group-hover/column:opacity-100 group-focus-within/column:opacity-100",
+          open && "opacity-100",
+          "hover:bg-destructive/10 hover:text-destructive",
+          "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background",
+          "disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-muted-foreground/70",
+        )}
+      >
+        <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+      </button>
+      <AlertDialog
+        open={open}
+        onOpenChange={(next) => {
+          // Block dismissal while the DELETE is in flight so the user can't
+          // navigate away mid-call and miss the toast outcome.
+          if (deleting && !next) return;
+          setOpen(next);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this column?</AlertDialogTitle>
+            <AlertDialogDescription>
+              “{column.name}” will be permanently removed. Tasks must be moved
+              first if any exist. This can&apos;t be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className={cn(buttonVariants({ variant: "destructive" }))}
+              disabled={deleting}
+              onClick={(event) => {
+                // Prevent Radix's default close-on-action so we can keep the
+                // dialog open across the network round-trip and surface
+                // 422-class errors in-place. Without this, a slow DELETE
+                // would drop the user back onto the board with only a
+                // toast for feedback.
+                event.preventDefault();
+                void handleConfirmDelete();
+              }}
+            >
+              {deleting ? (
+                <>
+                  <Loader2
+                    className="h-4 w-4 animate-spin"
+                    aria-hidden="true"
+                  />
+                  Deleting…
+                </>
+              ) : (
+                <>
+                  <Trash2 className="h-4 w-4" aria-hidden="true" />
+                  Delete column
+                </>
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   );
 }
 
