@@ -6,6 +6,7 @@ import { db } from "@/lib/db";
 import { columns, tasks, users } from "@/lib/db/schema";
 import { auth } from "@/lib/server/auth";
 import { resolveProjectAccessByProjectId } from "@/lib/server/projects/access";
+import { computeMoveOrder } from "@/lib/server/tasks/move-order";
 
 // Forced dynamic: every call mutates state and is gated by the session
 // cookie + tenant scope, so prerender / route caching must not apply.
@@ -264,50 +265,40 @@ export async function PATCH(
       // 3. Compute the new ordering for the target column. Pull every task
       //    currently in the target column EXCEPT the moving one, sort by
       //    position (asc id is the deterministic tiebreaker since the
-      //    schema explicitly tolerates transient ties), and splice the
-      //    moving task in at the clamped insert index.
+      //    schema explicitly tolerates transient ties), and delegate the
+      //    splice + re-stamp math to the pure `computeMoveOrder` helper.
+      //    Same-column reorder works here naturally: the moving task is
+      //    already excluded from `targetExisting`, so splicing it back in
+      //    at the clamped index yields the full post-move ordering.
       const targetExisting = await tx
         .select({ id: tasks.id, position: tasks.position })
         .from(tasks)
         .where(and(eq(tasks.columnId, tgtCol.id), ne(tasks.id, moving.id)))
         .orderBy(asc(tasks.position), asc(tasks.id));
 
-      const insertIndex = Math.min(
-        Math.max(Math.floor(newPosition), 0),
-        targetExisting.length,
-      );
-
-      const newOrder: Array<{ id: string; oldPosition: number | null }> = [
-        ...targetExisting
-          .slice(0, insertIndex)
-          .map((row) => ({ id: row.id, oldPosition: row.position })),
-        // The moving task is included with a sentinel oldPosition so the
-        // re-stamp loop always issues an UPDATE (we may also be flipping
-        // its columnId, which the per-row diff alone wouldn't catch).
-        { id: moving.id, oldPosition: null },
-        ...targetExisting
-          .slice(insertIndex)
-          .map((row) => ({ id: row.id, oldPosition: row.position })),
-      ];
+      const { order: newOrder } = computeMoveOrder({
+        existing: targetExisting,
+        movingTaskId: moving.id,
+        newPosition,
+      });
 
       // 4. Re-stamp 0..N-1. We skip rows whose position is already the
       //    correct value (no-op) to keep the write set minimal — a typical
       //    drop only shifts a contiguous window of cards by one.
-      for (let i = 0; i < newOrder.length; i++) {
-        const row = newOrder[i];
-        if (row.id === moving.id) {
+      for (const row of newOrder) {
+        if (row.isMoving) {
           await tx
             .update(tasks)
             .set({
               columnId: tgtCol.id,
-              position: i,
+              position: row.newPosition,
               updatedAt: sql`now()`,
             })
             .where(eq(tasks.id, moving.id));
-        } else if (row.oldPosition !== i) {
+        } else if (row.oldPosition !== row.newPosition) {
           await tx
             .update(tasks)
-            .set({ position: i })
+            .set({ position: row.newPosition })
             .where(eq(tasks.id, row.id));
         }
       }
