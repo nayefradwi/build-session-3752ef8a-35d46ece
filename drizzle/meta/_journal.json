@@ -8,6 +8,13 @@
       "when": 1777800023292,
       "tag": "0000_small_the_stranger",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1777801057355,
+      "tag": "0001_bored_forgotten_one",
+      "breakpoints": true
     }
   ]
 }
