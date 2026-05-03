@@ -9,6 +9,7 @@ import {
   KanbanSquare,
   Layers,
   Lock,
+  Plus,
   RefreshCw,
 } from "lucide-react";
 
@@ -16,6 +17,7 @@ import { ApiError, apiClient } from "@/lib/client/api-client";
 import { cn } from "@/lib/client/utils";
 import { Button } from "@/components/ui/button";
 import { BoardColumn, BoardColumnSkeleton } from "@/components/board/board-column";
+import { AddColumnDialog } from "@/components/board/add-column-dialog";
 import type { BoardColumnData, BoardTask } from "@/components/board/types";
 
 /* -------------------------------------------------------------------------- */
@@ -68,6 +70,25 @@ type TaskRow = {
 
 type TasksResponse = { tasks: TaskRow[] };
 
+/**
+ * Mirrors the response shape of `GET /api/teams/[teamId]`. We pull this only
+ * to determine the caller's per-team role — column management gates on team-
+ * admin (not tenant-admin), and the project endpoint only tells us
+ * `isMember`, not the role. One extra round trip in parallel with the project
+ * fetch is cheap and keeps the admin gate accurate.
+ */
+type TeamRole = "admin" | "member";
+
+type TeamMember = {
+  userId: string;
+  role: TeamRole;
+};
+
+type TeamDetailResponse = {
+  team: { id: string; name: string };
+  members: TeamMember[];
+};
+
 /* -------------------------------------------------------------------------- */
 /*                            Top-level component                             */
 /* -------------------------------------------------------------------------- */
@@ -108,11 +129,14 @@ type KanbanBoardProps = {
  *     Lanes shrink to ~256px to keep one fully visible.
  */
 export function KanbanBoard({ teamId }: KanbanBoardProps) {
-  const { status: sessionStatus } = useSession();
+  const { data: session, status: sessionStatus } = useSession();
+  const callerId = session?.user?.id ?? null;
 
   const [project, setProject] = useState<Project | null>(null);
   const [isMember, setIsMember] = useState(false);
+  const [isTeamAdmin, setIsTeamAdmin] = useState(false);
   const [columns, setColumns] = useState<BoardColumnData[]>([]);
+  const [addColumnOpen, setAddColumnOpen] = useState(false);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -127,10 +151,26 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
     try {
       // 1. Resolve the team's project. We need the projectId before we can
       //    fan out the columns + tasks reads, so this one is sequential.
-      const projectData = await apiClient.get<ProjectResponse>(
-        `/api/teams/${teamId}/project`,
-        { silent: true, skipAuthRedirect: true },
-      );
+      //    We fan out the team-detail fetch alongside, since it only depends
+      //    on `teamId` and the response feeds the team-admin gate for the
+      //    Add Column affordance.
+      const [projectData, teamDetail] = await Promise.all([
+        apiClient.get<ProjectResponse>(`/api/teams/${teamId}/project`, {
+          silent: true,
+          skipAuthRedirect: true,
+        }),
+        // The team-detail endpoint is tenant-gated but doesn't require
+        // membership — every tenant member can read the directory — so it
+        // returns a useful answer even for non-members. We tolerate failures
+        // here (a 404/403 just means "no admin affordance"); the project
+        // fetch above is the canonical access gate.
+        apiClient
+          .get<TeamDetailResponse>(`/api/teams/${teamId}`, {
+            silent: true,
+            skipAuthRedirect: true,
+          })
+          .catch(() => null),
+      ]);
 
       // 2. Parallel fetch of columns and tasks. Both endpoints scope the
       //    response to this project, so the client-side join is purely a
@@ -176,8 +216,19 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
         tasks: tasksByColumn.get(col.id) ?? [],
       }));
 
+      // Team-admin derivation: if the team-detail fetch failed (or the caller
+      // has no per-team membership row), `isTeamAdmin` stays false and the
+      // Add Column affordance is hidden. Tenant admins do NOT bypass — column
+      // management is a team-scoped operation, mirroring the server-side
+      // gate in POST /api/projects/[projectId]/columns.
+      const callerMembership =
+        callerId && teamDetail
+          ? teamDetail.members.find((m) => m.userId === callerId) ?? null
+          : null;
+
       setProject(projectData.project);
       setIsMember(projectData.isMember);
+      setIsTeamAdmin(callerMembership?.role === "admin");
       setColumns(hydrated);
     } catch (err) {
       if (err instanceof ApiError) {
@@ -194,7 +245,7 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
     } finally {
       setLoading(false);
     }
-  }, [teamId]);
+  }, [callerId, teamId]);
 
   // Wait for the session to settle before firing the fetch — the dashboard
   // layout already gates on auth, but a stale "loading" status would still
@@ -204,6 +255,33 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
     if (sessionStatus === "unauthenticated") return;
     void loadBoard();
   }, [loadBoard, sessionStatus]);
+
+  // Append-on-success: the POST handler returns the freshly inserted column
+  // (with its server-assigned id and position), so we splice it onto local
+  // state without a full board refetch. Re-sort by `position` defensively in
+  // case a sibling admin slipped a concurrent insert in between. Defined
+  // here (above the early returns) so the hook order stays stable across
+  // every render path.
+  const handleColumnCreated = useCallback(
+    (column: { id: string; projectId: string; name: string; position: number }) => {
+      setColumns((prev) => {
+        if (prev.some((c) => c.id === column.id)) return prev;
+        const next = [
+          ...prev,
+          {
+            id: column.id,
+            projectId: column.projectId,
+            name: column.name,
+            position: column.position,
+            tasks: [],
+          },
+        ];
+        next.sort((a, b) => a.position - b.position);
+        return next;
+      });
+    },
+    [],
+  );
 
   /* ------------------------------- Render -------------------------------- */
 
@@ -224,14 +302,29 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
   }
 
   return (
-    <BoardLayout
-      teamId={teamId}
-      project={project}
-      isMember={isMember}
-      columns={columns}
-      loading={loading}
-      onRefresh={() => void loadBoard()}
-    />
+    <>
+      <BoardLayout
+        teamId={teamId}
+        project={project}
+        isMember={isMember}
+        isTeamAdmin={isTeamAdmin}
+        columns={columns}
+        loading={loading}
+        onRefresh={() => void loadBoard()}
+        onRequestAddColumn={() => setAddColumnOpen(true)}
+      />
+      {/* Mounted only when we know the projectId AND the caller is a team
+          admin — the dialog needs the projectId to POST against, and the
+          server will 403 a non-admin's submission anyway. */}
+      {isTeamAdmin && project ? (
+        <AddColumnDialog
+          open={addColumnOpen}
+          onOpenChange={setAddColumnOpen}
+          projectId={project.id}
+          onCreated={handleColumnCreated}
+        />
+      ) : null}
+    </>
   );
 }
 
@@ -243,18 +336,22 @@ type BoardLayoutProps = {
   teamId: string;
   project: Project | null;
   isMember: boolean;
+  isTeamAdmin: boolean;
   columns: BoardColumnData[];
   loading: boolean;
   onRefresh: () => void;
+  onRequestAddColumn: () => void;
 };
 
 function BoardLayout({
   teamId,
   project,
   isMember,
+  isTeamAdmin,
   columns,
   loading,
   onRefresh,
+  onRequestAddColumn,
 }: BoardLayoutProps) {
   const totalTasks = useMemo(
     () => columns.reduce((sum, col) => sum + col.tasks.length, 0),
@@ -307,7 +404,12 @@ function BoardLayout({
         </div>
       </header>
 
-      <BoardColumns columns={columns} isMember={isMember} />
+      <BoardColumns
+        columns={columns}
+        isMember={isMember}
+        isTeamAdmin={isTeamAdmin}
+        onRequestAddColumn={onRequestAddColumn}
+      />
     </div>
   );
 }
@@ -319,12 +421,32 @@ function BoardLayout({
 type BoardColumnsProps = {
   columns: BoardColumnData[];
   isMember: boolean;
+  isTeamAdmin: boolean;
+  onRequestAddColumn: () => void;
 };
 
-function BoardColumns({ columns, isMember }: BoardColumnsProps) {
+function BoardColumns({
+  columns,
+  isMember,
+  isTeamAdmin,
+  onRequestAddColumn,
+}: BoardColumnsProps) {
   if (columns.length === 0) {
-    return <BoardEmptyState isMember={isMember} />;
+    return (
+      <BoardEmptyState
+        isMember={isMember}
+        isTeamAdmin={isTeamAdmin}
+        onRequestAddColumn={onRequestAddColumn}
+      />
+    );
   }
+
+  // Team admins can keep adding columns up to the server-side cap of 10.
+  // We hide the trigger past the cap so the affordance doesn't lure the
+  // admin into a guaranteed 422 — the server is still authoritative on the
+  // limit (concurrent inserts could push us over the threshold between
+  // renders), but this keeps the happy-path UI clean.
+  const canAddColumn = isTeamAdmin && columns.length < 10;
 
   return (
     // The board lives inside the dashboard's max-w-6xl container; we break
@@ -341,8 +463,43 @@ function BoardColumns({ columns, isMember }: BoardColumnsProps) {
         {columns.map((column) => (
           <BoardColumn key={column.id} column={column} />
         ))}
+        {canAddColumn ? (
+          <AddColumnTrigger onClick={onRequestAddColumn} />
+        ) : null}
       </div>
     </div>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            Add column trigger                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * "Add column" affordance rendered as the trailing tile in the columns row.
+ * Sized to match a real column so the row's vertical rhythm stays consistent
+ * — a dashed border + muted background signals "placeholder", and the icon
+ * + label give the click target a clear purpose at any width.
+ */
+function AddColumnTrigger({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label="Add column"
+      className={cn(
+        "flex w-64 shrink-0 flex-col items-center justify-center gap-2",
+        "rounded-lg border border-dashed bg-muted/30 px-3 py-6 text-sm font-medium text-muted-foreground",
+        "transition-colors hover:border-foreground/40 hover:bg-muted/60 hover:text-foreground",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ring-offset-background",
+        "md:w-72 lg:w-80",
+      )}
+    >
+      <span className="flex h-8 w-8 items-center justify-center rounded-full border bg-background">
+        <Plus className="h-4 w-4" aria-hidden="true" />
+      </span>
+      <span>Add column</span>
+    </button>
   );
 }
 
@@ -350,7 +507,15 @@ function BoardColumns({ columns, isMember }: BoardColumnsProps) {
 /*                              Empty state                                   */
 /* -------------------------------------------------------------------------- */
 
-function BoardEmptyState({ isMember }: { isMember: boolean }) {
+function BoardEmptyState({
+  isMember,
+  isTeamAdmin,
+  onRequestAddColumn,
+}: {
+  isMember: boolean;
+  isTeamAdmin: boolean;
+  onRequestAddColumn: () => void;
+}) {
   return (
     <div
       className="rounded-lg border border-dashed bg-background px-6 py-12 text-center"
@@ -362,10 +527,20 @@ function BoardEmptyState({ isMember }: { isMember: boolean }) {
       />
       <p className="mt-3 text-base font-medium">No columns yet</p>
       <p className="mx-auto mt-1 max-w-md text-sm text-muted-foreground">
-        {isMember
-          ? "A team admin can add columns to start organizing this board."
-          : "This board doesn't have any columns yet. Check back once the team has set things up."}
+        {isTeamAdmin
+          ? "Add the first column to start organizing this board."
+          : isMember
+            ? "A team admin can add columns to start organizing this board."
+            : "This board doesn't have any columns yet. Check back once the team has set things up."}
       </p>
+      {isTeamAdmin ? (
+        <div className="mt-4 flex justify-center">
+          <Button type="button" onClick={onRequestAddColumn}>
+            <Plus className="h-4 w-4" aria-hidden="true" />
+            Add column
+          </Button>
+        </div>
+      ) : null}
     </div>
   );
 }
