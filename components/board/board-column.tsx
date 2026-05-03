@@ -5,7 +5,8 @@ import {
   SortableContext,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
-import { Layers, Pencil, Plus } from "lucide-react";
+import { GripVertical, Layers, Pencil, Plus } from "lucide-react";
+import type { HTMLAttributes, Ref } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
@@ -14,6 +15,25 @@ import { cn } from "@/lib/client/utils";
 import { BoardTaskCard } from "@/components/board/board-task-card";
 import { SortableBoardTaskCard } from "@/components/board/sortable-task-card";
 import type { BoardColumnData, BoardTask } from "@/components/board/types";
+
+/* -------------------------------------------------------------------------- */
+/*                            Column drag handle props                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Drag-handle props produced by `useSortable` from `@dnd-kit/sortable` and
+ * forwarded by {@link import("./sortable-board-column").SortableBoardColumn}
+ * so the column header's grip button becomes the activator for the column-
+ * reorder gesture. The shape mirrors the task-card variant: `HTMLAttributes`
+ * plus an optional `ref` because dnd-kit's `setActivatorNodeRef` is what wires
+ * the activator into its internal accessibility tree. We attach the activator
+ * to a dedicated grip button (rather than the entire column header) so the
+ * existing inline-rename click affordance on the header keeps working without
+ * a press conflict.
+ */
+export type BoardColumnDragHandleProps = HTMLAttributes<HTMLButtonElement> & {
+  ref?: Ref<HTMLButtonElement>;
+};
 
 /* -------------------------------------------------------------------------- */
 /*                                   Column                                   */
@@ -75,6 +95,23 @@ type BoardColumnProps = {
     name: string;
     position: number;
   }) => void;
+  /**
+   * When provided, the column header renders a drag-handle (`GripVertical`)
+   * button wired up as the dnd-kit activator for column reordering. We keep
+   * the activator on a dedicated grip — rather than the whole column or the
+   * column title — so the existing inline-rename click handler on the title
+   * doesn't fight the press-and-drag gesture. Forwarded by
+   * {@link import("./sortable-board-column").SortableBoardColumn}; absent
+   * for non-admin callers, who never see a drag affordance.
+   */
+  dragHandleProps?: BoardColumnDragHandleProps;
+  /**
+   * Visual hint that this column is currently being dragged. The source
+   * column stays mounted (so dnd-kit can measure the placeholder slot), but
+   * fades to a translucent silhouette while a `DragOverlay` clone follows
+   * the cursor.
+   */
+  isDragging?: boolean;
 };
 
 /**
@@ -98,6 +135,8 @@ export function BoardColumn({
   canEditName = false,
   projectId,
   onRenamed,
+  dragHandleProps,
+  isDragging = false,
 }: BoardColumnProps) {
   const taskCount = column.tasks.length;
 
@@ -145,15 +184,28 @@ export function BoardColumn({
         canReorder &&
           columnIsOver &&
           "border-primary bg-primary/5 ring-2 ring-primary/40 ring-offset-2 ring-offset-background",
+        // Source-column placeholder while a column drag is in flight. We
+        // keep the lane mounted so sibling columns can compute their slide-
+        // aside transforms, but render it faded + dashed so the user reads
+        // it as a drop slot rather than the live column.
+        isDragging && "border-dashed opacity-40",
       )}
     >
       <header className="flex items-center justify-between gap-2 px-1">
-        <ColumnHeaderTitle
-          column={column}
-          canEditName={canEditName && Boolean(projectId)}
-          projectId={projectId}
-          onRenamed={onRenamed}
-        />
+        <div className="flex min-w-0 flex-1 items-center gap-1">
+          {dragHandleProps ? (
+            <ColumnDragHandle
+              dragHandleProps={dragHandleProps}
+              columnName={column.name}
+            />
+          ) : null}
+          <ColumnHeaderTitle
+            column={column}
+            canEditName={canEditName && Boolean(projectId)}
+            projectId={projectId}
+            onRenamed={onRenamed}
+          />
+        </div>
         <span
           className="inline-flex h-5 min-w-[1.25rem] shrink-0 items-center justify-center rounded-full bg-background px-1.5 text-xs font-medium text-muted-foreground"
           aria-hidden="true"
@@ -191,6 +243,60 @@ export function BoardColumn({
         />
       ) : null}
     </section>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            Column drag handle                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Grip-icon button that doubles as the dnd-kit activator for column
+ * reordering. Sits flush against the column title so it's discoverable
+ * without competing with the title's hover affordances:
+ *
+ *   - The grip is always visible to admins (low-contrast by default, full
+ *     opacity on hover/focus). Unlike the rename pencil it shouldn't be
+ *     hidden behind a hover, because the only useful interaction is the
+ *     drag itself — a fully-hidden grip on a touch device would have no
+ *     activation path.
+ *   - We render a real `<button>` rather than a div so keyboard focus +
+ *     `aria-label` come for free; the parent supplies dnd-kit's
+ *     `setActivatorNodeRef` via `dragHandleProps.ref` so the activator is
+ *     wired into the accessibility tree without us re-implementing focus
+ *     management.
+ *   - `cursor-grab` (and `active:cursor-grabbing` while pressed) telegraphs
+ *     that the element is the drag handle, mirroring task-card behavior.
+ *   - `onClick` is a no-op but we still attach `type="button"` so the
+ *     button never accidentally submits a parent form.
+ */
+function ColumnDragHandle({
+  dragHandleProps,
+  columnName,
+}: {
+  dragHandleProps: BoardColumnDragHandleProps;
+  columnName: string;
+}) {
+  const { ref, ...rest } = dragHandleProps;
+  return (
+    <button
+      ref={ref}
+      type="button"
+      aria-label={`Reorder ${columnName} column`}
+      // Touch-action none keeps mobile browsers from interpreting the press
+      // as a horizontal scroll gesture before the dnd-kit pointer sensor
+      // gets a chance to activate; without it, dragging the column on a
+      // touch device fights the page's overflow-x-auto scroll.
+      style={{ touchAction: "none" }}
+      className={cn(
+        "flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground/60",
+        "cursor-grab transition-colors hover:bg-background/60 hover:text-foreground active:cursor-grabbing",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background",
+      )}
+      {...rest}
+    >
+      <GripVertical className="h-3.5 w-3.5" aria-hidden="true" />
+    </button>
   );
 }
 
@@ -481,6 +587,62 @@ function ColumnEmptyState() {
       />
       <p className="text-xs text-muted-foreground">No tasks yet</p>
     </li>
+  );
+}
+
+/**
+ * Static visual replica of a column for use inside a `DragOverlay` clone.
+ *
+ * Why a separate component: `BoardColumn` registers a `useDroppable` for the
+ * empty-lane drop target and renders a `SortableContext` for its tasks.
+ * Mounting that tree inside `DragOverlay` would re-register the same
+ * `col-${id}` droppable, triggering dnd-kit's "duplicate id" warning and
+ * confusing collision detection. The overlay only needs the visual frame
+ * (header + count + a non-interactive list of cards), so we render a thin
+ * static replica with no dnd-kit hooks. The result follows the cursor while
+ * the source column stays mounted in-place as a translucent placeholder.
+ */
+export function BoardColumnOverlay({ column }: { column: BoardColumnData }) {
+  const taskCount = column.tasks.length;
+  return (
+    <section
+      aria-hidden="true"
+      className="flex w-64 shrink-0 flex-col gap-3 rounded-lg border bg-background p-3 shadow-2xl md:w-72 lg:w-80"
+    >
+      <header className="flex items-center justify-between gap-2 px-1">
+        <div className="flex min-w-0 flex-1 items-center gap-1">
+          <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground/70">
+            <GripVertical className="h-3.5 w-3.5" aria-hidden="true" />
+          </span>
+          <h2 className="min-w-0 flex-1 truncate text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+            {column.name}
+          </h2>
+        </div>
+        <span className="inline-flex h-5 min-w-[1.25rem] shrink-0 items-center justify-center rounded-full bg-background px-1.5 text-xs font-medium text-muted-foreground">
+          {taskCount}
+        </span>
+      </header>
+      <ol className="flex min-h-[2.5rem] flex-col gap-2" role="list">
+        {column.tasks.length === 0 ? (
+          <li
+            className="flex flex-col items-center gap-1 rounded-md border border-dashed bg-background/60 px-3 py-6 text-center"
+            role="status"
+          >
+            <Layers
+              className="h-4 w-4 text-muted-foreground"
+              aria-hidden="true"
+            />
+            <p className="text-xs text-muted-foreground">No tasks yet</p>
+          </li>
+        ) : (
+          column.tasks.map((task) => (
+            <li key={task.id} className="list-none">
+              <BoardTaskCard task={task} />
+            </li>
+          ))
+        )}
+      </ol>
+    </section>
   );
 }
 

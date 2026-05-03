@@ -14,6 +14,10 @@ import {
   type DragStartEvent,
 } from "@dnd-kit/core";
 import {
+  SortableContext,
+  horizontalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import {
   AlertCircle,
   ArrowLeft,
   KanbanSquare,
@@ -27,7 +31,11 @@ import { toast } from "sonner";
 import { ApiError, apiClient } from "@/lib/client/api-client";
 import { cn } from "@/lib/client/utils";
 import { Button } from "@/components/ui/button";
-import { BoardColumn, BoardColumnSkeleton } from "@/components/board/board-column";
+import {
+  BoardColumnOverlay,
+  BoardColumnSkeleton,
+} from "@/components/board/board-column";
+import { SortableBoardColumn } from "@/components/board/sortable-board-column";
 import { BoardTaskCard } from "@/components/board/board-task-card";
 import { AddColumnDialog } from "@/components/board/add-column-dialog";
 import {
@@ -514,11 +522,27 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
   // card is mid-optimistic-splice.
   const [activeTask, setActiveTask] = useState<BoardTask | null>(null);
 
+  // Active column being dragged — drives the column-shaped `DragOverlay`
+  // clone. Like `activeTask`, we snapshot the column at drag-start so the
+  // overlay keeps rendering even after the optimistic reorder has shuffled
+  // the source's place in `columns`.
+  const [activeColumn, setActiveColumn] = useState<BoardColumnData | null>(
+    null,
+  );
+
   // Snapshot of the columns slice taken at drag-start, so we can roll back
   // cleanly if the move endpoint fails. We use a ref (not state) because
   // the rollback never needs to drive a render — it overwrites `columns`
   // directly via `setColumns`.
   const rollbackSnapshotRef = useRef<BoardColumnData[] | null>(null);
+
+  // Separate snapshot ref for column reorder rollbacks. We keep this
+  // disjoint from `rollbackSnapshotRef` (used by the task-move gesture) so
+  // a fast user who starts a column drag while a task move's PATCH is still
+  // in flight doesn't accidentally clobber the other gesture's rollback
+  // state. Both snapshots are full-board copies — overlap is fine, but
+  // the lifetimes are independent.
+  const columnRollbackSnapshotRef = useRef<BoardColumnData[] | null>(null);
 
   // Pointer-distance activation: a click of <6px doesn't trigger a drag,
   // so the existing "click card → open detail modal" path stays intact.
@@ -534,18 +558,29 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
   const handleDragStart = useCallback(
     (event: DragStartEvent) => {
       const data = event.active.data.current as
-        | { type?: string; task?: BoardTask }
+        | { type?: string; task?: BoardTask; columnId?: string }
         | undefined;
-      if (data?.type !== "task" || !data.task) return;
-      setActiveTask(data.task);
-      rollbackSnapshotRef.current = columns;
+      if (data?.type === "task" && data.task) {
+        setActiveTask(data.task);
+        rollbackSnapshotRef.current = columns;
+        return;
+      }
+      if (data?.type === "column-sortable") {
+        const dragged =
+          columns.find((c) => c.id === String(event.active.id)) ?? null;
+        if (!dragged) return;
+        setActiveColumn(dragged);
+        columnRollbackSnapshotRef.current = columns;
+      }
     },
     [columns],
   );
 
   const handleDragCancel = useCallback(() => {
     setActiveTask(null);
+    setActiveColumn(null);
     rollbackSnapshotRef.current = null;
+    columnRollbackSnapshotRef.current = null;
   }, []);
 
   /**
@@ -618,9 +653,149 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
     [],
   );
 
+  /**
+   * Persist a column reorder via PATCH /api/projects/[projectId]/columns/reorder
+   * with optimistic UI.
+   *
+   *   - Optimistic state: the caller (handleDragEnd) has already applied a
+   *     reordered + re-stamped `columns` array via `setColumns(next)`. We
+   *     only roll back on error.
+   *   - Server response: the handler returns the project's full column list
+   *     in canonical order, with positions re-stamped on the same
+   *     POSITION_STEP (1000) cadence we used optimistically. We sync the
+   *     authoritative positions onto local state — the order should already
+   *     match, but if a sibling admin slipped a concurrent rename in between
+   *     the new name lands here too.
+   *   - On failure: restore the snapshot taken at drag-start and toast.
+   */
+  const persistColumnReorder = useCallback(
+    async (
+      projectId: string,
+      orderedColumnIds: string[],
+      snapshot: BoardColumnData[],
+    ) => {
+      try {
+        const response = await apiClient.patch<{ columns: ColumnRow[] }>(
+          `/api/projects/${projectId}/columns/reorder`,
+          { orderedColumnIds },
+          { silent: true, skipAuthRedirect: false },
+        );
+        // Sync the server's authoritative position + name back onto each
+        // column's local row, preserving the `tasks` slice (reorder doesn't
+        // touch tasks). We re-sort defensively in case a concurrent admin
+        // operation interleaved while the PATCH was in flight.
+        setColumns((prev) => {
+          const byId = new Map(response.columns.map((c) => [c.id, c]));
+          let touched = false;
+          const next = prev.map((col) => {
+            const updated = byId.get(col.id);
+            if (!updated) return col;
+            if (
+              col.position === updated.position &&
+              col.name === updated.name &&
+              col.projectId === updated.projectId
+            ) {
+              return col;
+            }
+            touched = true;
+            return {
+              ...col,
+              projectId: updated.projectId,
+              name: updated.name,
+              position: updated.position,
+            };
+          });
+          if (!touched) return prev;
+          next.sort((a, b) => a.position - b.position);
+          return next;
+        });
+      } catch (err) {
+        // Roll back to the pre-drag snapshot. Passed in explicitly (rather
+        // than read from the ref) so a fast user who started a second drag
+        // while the PATCH was in flight doesn't see the wrong rollback.
+        setColumns(snapshot);
+        const description =
+          err instanceof ApiError
+            ? err.message
+            : "We couldn't reorder those columns. Please try again.";
+        toast.error("Couldn't reorder columns", { description });
+      } finally {
+        columnRollbackSnapshotRef.current = null;
+      }
+    },
+    [],
+  );
+
   const handleDragEnd = useCallback(
     (event: DragEndEvent) => {
       const { active, over } = event;
+      const activeData = active.data.current as
+        | {
+            type?: string;
+            task?: BoardTask;
+            columnId?: string;
+          }
+        | undefined;
+
+      // Column-reorder branch — handled before the task path so we can bail
+      // early without touching the task-move snapshot. The dnd-kit data
+      // type "column-sortable" is what the SortableBoardColumn wrapper
+      // tags its sortable item with; the existing per-column droppable
+      // (data.type "column") is for *task* drops onto an empty lane and is
+      // unrelated to this gesture.
+      if (activeData?.type === "column-sortable") {
+        const colSnapshot = columnRollbackSnapshotRef.current;
+        setActiveColumn(null);
+        if (!colSnapshot || !over || !project) {
+          columnRollbackSnapshotRef.current = null;
+          return;
+        }
+        const overData = over.data.current as
+          | { type?: string; columnId?: string }
+          | undefined;
+        // Only column-sortable overs participate in column reorder. If the
+        // user happens to release over a task-level droppable (because the
+        // closestCorners algorithm latched onto a task while crossing into
+        // a column) we treat it as a no-op rather than guessing intent.
+        if (overData?.type !== "column-sortable") {
+          columnRollbackSnapshotRef.current = null;
+          return;
+        }
+        const activeColId = String(active.id);
+        const overColId = String(over.id);
+        const oldIndex = colSnapshot.findIndex((c) => c.id === activeColId);
+        const newIndex = colSnapshot.findIndex((c) => c.id === overColId);
+        if (oldIndex < 0 || newIndex < 0) {
+          columnRollbackSnapshotRef.current = null;
+          return;
+        }
+        // No-op drop: dropped right back where the column started. Skip
+        // the round trip entirely so a stray click-and-release doesn't
+        // churn the database.
+        if (oldIndex === newIndex) {
+          columnRollbackSnapshotRef.current = null;
+          return;
+        }
+
+        // Splice + re-stamp on a fresh copy. Position assignment mirrors
+        // the server's canonical `recalculatePositions` (index * 1000) so
+        // the optimistic state matches whatever the PATCH echoes back.
+        const reordered = [...colSnapshot];
+        const [moved] = reordered.splice(oldIndex, 1);
+        reordered.splice(newIndex, 0, moved);
+        const optimistic = reordered.map((c, i) => ({
+          ...c,
+          position: i * 1000,
+        }));
+        setColumns(optimistic);
+        void persistColumnReorder(
+          project.id,
+          reordered.map((c) => c.id),
+          colSnapshot,
+        );
+        return;
+      }
+
       const snapshot = rollbackSnapshotRef.current;
       // Always clear the overlay clone — even on a no-op drop, the source
       // should stop reading as "being dragged".
@@ -632,9 +807,6 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
       }
 
       const activeId = String(active.id);
-      const activeData = active.data.current as
-        | { type?: string; task?: BoardTask; columnId?: string }
-        | undefined;
       if (activeData?.type !== "task") {
         rollbackSnapshotRef.current = null;
         return;
@@ -685,7 +857,10 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
           rollbackSnapshotRef.current = null;
           return;
         }
-      } else if (overData?.type === "column" && overData.columnId) {
+      } else if (
+        (overData?.type === "column" || overData?.type === "column-sortable") &&
+        overData.columnId
+      ) {
         // Hovered over a column body (typically: empty lane or trailing
         // whitespace). Append to the end of the target column. For a
         // same-column drop here, we use `length - 1` since the moving task
@@ -693,6 +868,13 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
         // last slot" — server clamps anyway, but matching the math keeps
         // the optimistic state from temporarily showing the card past the
         // end.
+        //
+        // We accept BOTH "column" and "column-sortable" because the column-
+        // reorder wrapper registers a sortable droppable on the same
+        // bounding box as the existing per-column "column" droppable.
+        // closestCorners can resolve to either when a task is dragged over
+        // a populated lane's chrome — treating both the same here keeps
+        // task drops working regardless of which one wins the tie-break.
         targetColumnId = overData.columnId;
         const targetCol = snapshot.find((c) => c.id === targetColumnId);
         if (!targetCol) {
@@ -734,7 +916,7 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
       setColumns(next);
       void persistMove(activeId, targetColumnId, newPosition, snapshot);
     },
-    [persistMove],
+    [persistMove, persistColumnReorder, project],
   );
 
   /* ------------------------------- Render -------------------------------- */
@@ -783,15 +965,22 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
           onColumnRenamed={handleColumnRenamed}
         />
         {/* The DragOverlay clone follows the cursor while a drag is in
-            progress. We render a non-interactive `BoardTaskCard` (no
-            `onSelect`) so the clone doesn't try to absorb pointer events
-            — it's purely a visual mirror of the source card. The slight
-            rotation + larger shadow are conventional cues that the card
-            is "lifted" above the board. */}
+            progress. For a task drag we render a non-interactive
+            `BoardTaskCard` (no `onSelect`) so the clone doesn't try to
+            absorb pointer events — it's purely a visual mirror of the
+            source card. For a column drag we render the static
+            `BoardColumnOverlay` replica (no inner dnd-kit hooks) so we
+            don't double-register the column's droppable id. Slight
+            rotation + larger shadow are conventional cues that the
+            element is "lifted" above the board. */}
         <DragOverlay dropAnimation={null}>
           {activeTask ? (
             <div className="rotate-2 cursor-grabbing shadow-2xl">
               <BoardTaskCard task={activeTask} />
+            </div>
+          ) : activeColumn ? (
+            <div className="rotate-1 cursor-grabbing">
+              <BoardColumnOverlay column={activeColumn} />
             </div>
           ) : null}
         </DragOverlay>
@@ -1002,6 +1191,13 @@ function BoardColumns({
   canReorder,
   onColumnRenamed,
 }: BoardColumnsProps) {
+  // Memoize the sortable item ids — `SortableContext` re-registers items on
+  // every prop identity change, and the parent re-renders this subtree
+  // whenever any unrelated piece of board state shifts (a task title edit,
+  // a card drag completes, a column rename, etc.). Hooks must be declared
+  // before the early return below to keep the order stable across renders.
+  const columnIds = useMemo(() => columns.map((c) => c.id), [columns]);
+
   if (columns.length === 0) {
     return (
       <BoardEmptyState
@@ -1031,33 +1227,50 @@ function BoardColumns({
       aria-label="Kanban board"
     >
       <div className="flex gap-4 px-4 sm:gap-5 sm:px-6">
-        {columns.map((column) => (
-          <BoardColumn
-            key={column.id}
-            column={column}
-            // Team-member gate: only members can append tasks (the server
-            // 403s non-members regardless of project visibility). Hiding the
-            // affordance keeps the read-only experience clean for visitors
-            // on a public project.
-            canAddTask={isMember}
-            onRequestAddTask={() => onRequestAddTask(column.id)}
-            // Click on any card in this lane opens the shared task-detail
-            // modal mounted by the parent KanbanBoard. Visitors of a public
-            // project (non-members) still get this — the GET endpoint only
-            // requires tenant + project visibility, not membership.
-            onSelectTask={onSelectTask}
-            // Drag-to-reorder is gated on the same team-member rule as
-            // task creation, since the move endpoint enforces the check
-            // server-side anyway.
-            canReorder={canReorder}
-            // Inline rename gate mirrors the server-side team-admin check
-            // on PUT /api/projects/[projectId]/columns/[columnId]. Tenant
-            // admins do NOT bypass; column management is team-scoped.
-            canEditName={isTeamAdmin}
-            projectId={projectId ?? undefined}
-            onRenamed={onColumnRenamed}
-          />
-        ))}
+        {/* Horizontal sortable context for column reorder. We always render
+            the SortableContext (rather than gating it on isTeamAdmin) so the
+            React tree shape stays stable across membership transitions; the
+            individual columns are what register/disable themselves with
+            dnd-kit via `canReorderColumns`. Items list mirrors `columns`
+            order so dnd-kit's index math matches the rendered DOM. */}
+        <SortableContext
+          items={columnIds}
+          strategy={horizontalListSortingStrategy}
+        >
+          {columns.map((column) => (
+            <SortableBoardColumn
+              key={column.id}
+              column={column}
+              // Column drag-reorder gate mirrors the server-side team-admin
+              // check on PATCH /api/projects/[projectId]/columns/reorder.
+              // Tenant admins do NOT bypass; column management is team-
+              // scoped, just like inline rename. Disabled for non-admins so
+              // the SortableContext above stays a no-op for them.
+              canReorderColumns={isTeamAdmin}
+              // Team-member gate: only members can append tasks (the server
+              // 403s non-members regardless of project visibility). Hiding the
+              // affordance keeps the read-only experience clean for visitors
+              // on a public project.
+              canAddTask={isMember}
+              onRequestAddTask={() => onRequestAddTask(column.id)}
+              // Click on any card in this lane opens the shared task-detail
+              // modal mounted by the parent KanbanBoard. Visitors of a public
+              // project (non-members) still get this — the GET endpoint only
+              // requires tenant + project visibility, not membership.
+              onSelectTask={onSelectTask}
+              // Task drag-to-reorder is gated on the same team-member rule
+              // as task creation, since the task-move endpoint enforces the
+              // check server-side anyway.
+              canReorder={canReorder}
+              // Inline rename gate mirrors the server-side team-admin check
+              // on PUT /api/projects/[projectId]/columns/[columnId]. Tenant
+              // admins do NOT bypass; column management is team-scoped.
+              canEditName={isTeamAdmin}
+              projectId={projectId ?? undefined}
+              onRenamed={onColumnRenamed}
+            />
+          ))}
+        </SortableContext>
         {canAddColumn ? (
           <AddColumnTrigger onClick={onRequestAddColumn} />
         ) : null}
