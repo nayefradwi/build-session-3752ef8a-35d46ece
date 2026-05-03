@@ -335,6 +335,31 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
     );
   }, []);
 
+  // Sync-on-success for task edits: the PUT handler returns the updated
+  // task (including columnId/position, which the edit form doesn't touch
+  // but we read defensively in case a future surface adds them). We swap
+  // the matching row in the owning column's task list. Edits don't move
+  // tasks across columns today — the move endpoint is a separate PATCH —
+  // so we only have to walk one column. Position can theoretically shift
+  // if a sibling re-orders the lane between fetches, so we re-sort
+  // defensively.
+  const handleTaskUpdated = useCallback((task: BoardTask) => {
+    setColumns((prev) =>
+      prev.map((column) => {
+        if (column.id !== task.columnId) return column;
+        let touched = false;
+        const tasks = column.tasks.map((t) => {
+          if (t.id !== task.id) return t;
+          touched = true;
+          return task;
+        });
+        if (!touched) return column;
+        tasks.sort((a, b) => a.position - b.position);
+        return { ...column, tasks };
+      }),
+    );
+  }, []);
+
   // Resolve the column the "Add task" dialog is targeting (lifted up so the
   // dialog stays a single mounted instance). Memoized so the dialog props
   // stay referentially stable across unrelated re-renders.
@@ -408,13 +433,22 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
           unconditionally (the modal itself no-ops when `taskId` is null
           AND it isn't open) so opening a card animates in cleanly without
           a fresh mount. The modal re-fetches `GET /api/tasks/[taskId]`
-          every time it opens, which is cheap and keeps the surface fresh. */}
+          every time it opens, which is cheap and keeps the surface fresh.
+          We forward `canEdit` (gated on team membership — non-members
+          would 403 a save anyway) and the team roster so the in-modal
+          edit form can populate its assignee dropdown without a fresh
+          fetch. The `onUpdated` callback splices the freshly-saved task
+          into the local board state, so the touched card reflects the
+          new fields immediately. */}
       <TaskDetailModal
         open={detailTaskId !== null}
         onOpenChange={(next) => {
           if (!next) setDetailTaskId(null);
         }}
         taskId={detailTaskId}
+        canEdit={isMember}
+        members={teamMembers}
+        onUpdated={handleTaskUpdated}
       />
     </>
   );

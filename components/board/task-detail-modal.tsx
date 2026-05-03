@@ -1,17 +1,28 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useState,
+  type ChangeEvent,
+  type FormEvent,
+} from "react";
 import {
   AlertCircle,
   CalendarClock,
   CalendarPlus,
   Download,
   FileText,
+  Loader2,
   Paperclip,
+  Pencil,
   RefreshCw,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { toast } from "sonner";
 
 import { ApiError, apiClient } from "@/lib/client/api-client";
 import { cn } from "@/lib/client/utils";
@@ -22,9 +33,15 @@ import {
   DialogClose,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import type { AddTaskTeamMember } from "@/components/board/add-task-dialog";
+import type { BoardTask } from "@/components/board/types";
 
 /* -------------------------------------------------------------------------- */
 /*                                API contract                                */
@@ -70,6 +87,31 @@ type TaskDetail = {
 };
 
 type TaskDetailResponse = { task: TaskDetail };
+
+/**
+ * Mirrors the response of `PUT /api/tasks/[taskId]`. The shape matches
+ * `TaskDetail` minus the `attachments` field — the write endpoint doesn't
+ * touch attachments so the response omits the array. We map back into the
+ * detail shape locally by preserving the existing `attachments` array.
+ */
+type UpdatedTask = Omit<TaskDetail, "attachments">;
+type UpdateTaskResponse = { task: UpdatedTask };
+
+/* -------------------------------------------------------------------------- */
+/*                                Constants                                   */
+/* -------------------------------------------------------------------------- */
+
+/** Mirrors the server-side validation in `PUT /api/tasks/[taskId]`. Keep
+ *  these in sync with the API so the user gets immediate client-side
+ *  feedback before incurring a 400 round-trip. */
+const TITLE_MAX = 200;
+const DESCRIPTION_MAX = 10_000;
+
+/** Sentinel value for the "Unassigned" option in the native select. The
+ *  empty string can't appear as a real userId, so we encode "no assignee"
+ *  with this and translate to `null` on submit. Mirrors the pattern in
+ *  `add-task-dialog.tsx`. */
+const UNASSIGNED_VALUE = "__unassigned__";
 
 /* -------------------------------------------------------------------------- */
 /*                                  Helpers                                   */
@@ -133,20 +175,56 @@ export type TaskDetailModalProps = {
    * the dialog is open swaps the underlying fetch (skeleton → new content).
    */
   taskId: string | null;
+  /**
+   * Whether the caller has write access on the task. Gates the Edit button.
+   * The PUT endpoint requires team membership of the owning team — non-
+   * members would 403 a save anyway — so the parent passes `isMember` here.
+   * Defaults to false so a parent that hasn't opted in keeps the modal
+   * read-only.
+   */
+  canEdit?: boolean;
+  /**
+   * Members of the owning team, surfaced in the assignee dropdown of the
+   * edit form. The server enforces that the assignee must be a team member,
+   * so the dropdown is restricted to this list. Optional — when absent, the
+   * dropdown only offers "Unassigned" plus (if currently assigned) the
+   * existing assignee, so the user can at least clear a stale assignment.
+   */
+  members?: AddTaskTeamMember[];
+  /**
+   * Called with the freshly-saved task on a successful edit. The caller is
+   * expected to splice the update into its local board state so the
+   * touched card reflects the new fields without a full board refetch.
+   */
+  onUpdated?: (task: BoardTask) => void;
 };
 
 /**
  * Detail view for a single task, opened from a card click on the kanban
- * board. Driven entirely by `GET /api/tasks/[taskId]` — this surface owns
- * the read, so the parent only has to hand us the id.
+ * board. Driven entirely by `GET /api/tasks/[taskId]` for the read path
+ * (the parent only has to hand us the id) and by `PUT /api/tasks/[taskId]`
+ * for the in-modal edit path.
  *
- *   - While the request is in flight, renders a skeleton placeholder so the
- *     dialog content area doesn't reflow when data lands.
- *   - On success, renders the title, the markdown-rendered description,
- *     assignee identity, attachments (with download links), and the
- *     created/updated timestamps.
- *   - On error, renders an alert with a Retry button so a transient network
- *     blip doesn't force the user to close + reopen.
+ * Two modes:
+ *
+ *   - **View** (default): renders the title, the markdown-rendered
+ *     description, assignee identity, attachments (with download links),
+ *     and the created/updated timestamps. An "Edit" affordance in the
+ *     footer flips the body to edit mode (gated on `canEdit`).
+ *   - **Edit**: replaces the title/description/assignee sections with
+ *     editable inputs, validates client-side (title non-empty, length
+ *     caps), and on save PUTs to `/api/tasks/[taskId]`. On success we
+ *     update the modal's local task state so the view-mode read reflects
+ *     the new fields immediately, fire `onUpdated` so the parent can sync
+ *     the board's local task list, show a confirmation toast, and flip
+ *     back to view mode.
+ *
+ * Loading + error UX:
+ *
+ *   - While the GET request is in flight, renders a skeleton placeholder so
+ *     the dialog content area doesn't reflow when data lands.
+ *   - On a load error, renders an alert with a Retry button so a transient
+ *     network blip doesn't force the user to close + reopen.
  *
  * Implementation notes:
  *
@@ -159,14 +237,18 @@ export type TaskDetailModalProps = {
  *     animation runs through Radix; gating the content on `taskId` keeps
  *     the rendered tree stable while the dialog is closed.
  *   - The shipped `Dialog` primitive already includes a top-right close (X)
- *     button (see `components/ui/dialog.tsx`); we add an explicit footer
- *     "Close" button for keyboard/touch parity, satisfying the spec's
- *     "include a close button" requirement.
+ *     button (see `components/ui/dialog.tsx`); the footer carries explicit
+ *     Close / Edit / Save / Cancel affordances depending on the mode.
+ *   - The dialog can't be dismissed while a save is in flight — we'd
+ *     otherwise lose the result of an already-in-flight PUT.
  */
 export function TaskDetailModal({
   open,
   onOpenChange,
   taskId,
+  canEdit = false,
+  members,
+  onUpdated,
 }: TaskDetailModalProps) {
   const [task, setTask] = useState<TaskDetail | null>(null);
   const [loading, setLoading] = useState(false);
@@ -175,6 +257,13 @@ export function TaskDetailModal({
   const [forbidden, setForbidden] = useState(false);
   // Bumped to force a refetch from the Retry button without changing taskId.
   const [retryCounter, setRetryCounter] = useState(0);
+  // View / edit mode flag. We always re-enter view mode on (re)open so a
+  // user who closed mid-edit and reopens the same task lands in the read
+  // surface — discarding edits explicitly is a Cancel button decision.
+  const [editing, setEditing] = useState(false);
+  // Save in-flight indicator. While true the dialog can't be dismissed and
+  // the form controls are disabled.
+  const [saving, setSaving] = useState(false);
 
   // Reset transient state every time the dialog closes so a re-open on the
   // same id doesn't briefly flash the previous task's content (or stale
@@ -186,6 +275,8 @@ export function TaskDetailModal({
       setNotFound(false);
       setForbidden(false);
       setLoading(false);
+      setEditing(false);
+      setSaving(false);
     }
   }, [open]);
 
@@ -202,6 +293,9 @@ export function TaskDetailModal({
     setError(null);
     setNotFound(false);
     setForbidden(false);
+    // Switching tasks (or re-fetching via Retry) returns us to view mode so
+    // a stale edit form for a different task can't survive the transition.
+    setEditing(false);
 
     apiClient
       .get<TaskDetailResponse>(`/api/tasks/${taskId}`, {
@@ -236,8 +330,53 @@ export function TaskDetailModal({
     };
   }, [open, taskId, retryCounter]);
 
+  // Apply a successful save: update the modal's local task state in-place
+  // (so the view mode renders the new fields without a re-fetch) and
+  // forward a board-shaped slice to the parent so it can sync the touched
+  // card. We preserve the existing `attachments` array — the PUT endpoint
+  // doesn't touch attachments and its response omits the field.
+  const applyUpdate = useCallback(
+    (updated: UpdatedTask) => {
+      setTask((prev) =>
+        prev
+          ? {
+              ...prev,
+              title: updated.title,
+              description: updated.description,
+              assignee: updated.assignee,
+              updatedAt: updated.updatedAt,
+              // columnId / position / createdAt are echoed unchanged by the
+              // PUT handler, but we still trust the response to absorb any
+              // drift the server might surface in the future.
+              columnId: updated.columnId,
+              position: updated.position,
+              createdAt: updated.createdAt,
+            }
+          : prev,
+      );
+
+      onUpdated?.({
+        id: updated.id,
+        columnId: updated.columnId,
+        title: updated.title,
+        description: updated.description,
+        position: updated.position,
+        assignee: updated.assignee,
+      });
+    },
+    [onUpdated],
+  );
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        // Block dismiss while a save is in flight so we don't strand the
+        // user without confirmation of the result.
+        if (saving && !next) return;
+        onOpenChange(next);
+      }}
+    >
       <DialogContent
         className={cn(
           // The default content max-w-lg is right for a quick form, but the
@@ -260,10 +399,26 @@ export function TaskDetailModal({
             onClose={() => onOpenChange(false)}
           />
         ) : task ? (
-          <TaskDetailBody
-            task={task}
-            onClose={() => onOpenChange(false)}
-          />
+          editing ? (
+            <TaskDetailEditForm
+              task={task}
+              members={members ?? []}
+              saving={saving}
+              setSaving={setSaving}
+              onCancel={() => setEditing(false)}
+              onSaved={(updated) => {
+                applyUpdate(updated);
+                setEditing(false);
+              }}
+            />
+          ) : (
+            <TaskDetailBody
+              task={task}
+              canEdit={canEdit}
+              onEdit={() => setEditing(true)}
+              onClose={() => onOpenChange(false)}
+            />
+          )
         ) : null}
       </DialogContent>
     </Dialog>
@@ -276,9 +431,13 @@ export function TaskDetailModal({
 
 function TaskDetailBody({
   task,
+  canEdit,
+  onEdit,
   onClose,
 }: {
   task: TaskDetail;
+  canEdit: boolean;
+  onEdit: () => void;
   onClose: () => void;
 }) {
   return (
@@ -391,13 +550,374 @@ function TaskDetailBody({
         </section>
       </div>
 
-      <div className="flex justify-end pt-2">
+      <DialogFooter>
         <DialogClose asChild>
           <Button type="button" variant="outline" onClick={onClose}>
             Close
           </Button>
         </DialogClose>
-      </div>
+        {canEdit ? (
+          <Button type="button" onClick={onEdit}>
+            <Pencil className="h-4 w-4" aria-hidden="true" />
+            Edit
+          </Button>
+        ) : null}
+      </DialogFooter>
+    </>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              Edit form                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * In-modal edit form. Replaces the read body when the user clicks Edit.
+ *
+ * Field rules (mirror the server-side validation in `PUT /api/tasks/[taskId]`):
+ *
+ *   - Title is required (non-empty after trim) and capped at 200 chars.
+ *   - Description is optional, capped at 10 000 chars; an empty/whitespace
+ *     value is normalized to `null` on submit so the server clears the
+ *     stored description.
+ *   - Assignee is optional. The native select is restricted to the team's
+ *     membership list (the server otherwise returns 422 INVALID_INPUT). If
+ *     the current assignee isn't in the supplied roster (e.g. the parent
+ *     hasn't passed `members`), we still surface them as the selected
+ *     option so a save without changes doesn't silently unassign.
+ *
+ * The dropdown is a native `<select>` to match the create dialog's pattern
+ * (`add-task-dialog.tsx`) — there's no Radix Select primitive shipped in
+ * this project yet, and a native select stays keyboard- and screen-reader-
+ * accessible out of the box.
+ */
+function TaskDetailEditForm({
+  task,
+  members,
+  saving,
+  setSaving,
+  onCancel,
+  onSaved,
+}: {
+  task: TaskDetail;
+  members: AddTaskTeamMember[];
+  saving: boolean;
+  setSaving: (saving: boolean) => void;
+  onCancel: () => void;
+  onSaved: (updated: UpdatedTask) => void;
+}) {
+  const titleInputId = useId();
+  const descriptionInputId = useId();
+  const assigneeInputId = useId();
+  const titleErrorId = useId();
+  const descriptionErrorId = useId();
+  const descriptionHintId = useId();
+
+  const [title, setTitle] = useState(task.title);
+  const [description, setDescription] = useState(task.description ?? "");
+  const [assigneeId, setAssigneeId] = useState<string>(
+    task.assignee?.id ?? UNASSIGNED_VALUE,
+  );
+  const [titleError, setTitleError] = useState<string | null>(null);
+  const [descriptionError, setDescriptionError] = useState<string | null>(null);
+
+  const trimmedTitle = useMemo(() => title.trim(), [title]);
+  const trimmedTitleLength = trimmedTitle.length;
+  const descriptionLength = description.length;
+
+  // Sorted members for the dropdown: name (case-insensitive) then email so
+  // the list reads the same way on every open. Memoized — sorting on every
+  // keystroke would churn the option list and reset the user's select focus.
+  const sortedMembers = useMemo(() => {
+    const copy = [...members];
+    copy.sort((a, b) => {
+      const an = (a.name ?? "").toLowerCase();
+      const bn = (b.name ?? "").toLowerCase();
+      if (an !== bn) return an < bn ? -1 : 1;
+      return a.email < b.email ? -1 : a.email > b.email ? 1 : 0;
+    });
+    return copy;
+  }, [members]);
+
+  // If the current assignee isn't in the supplied roster, surface them as
+  // an additional option so the user's existing pick stays representable.
+  // (Without this, a missing roster would silently unassign on save: the
+  // <select> would fall through to "Unassigned" because the assigneeId
+  // value wouldn't match any rendered option.)
+  const showCurrentAssigneeFallback =
+    task.assignee !== null &&
+    !sortedMembers.some((m) => m.userId === task.assignee?.id);
+
+  const onSubmit = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (saving) return;
+
+      // Run client-side validation first so the user sees both field errors
+      // simultaneously rather than fixing one and re-submitting to discover
+      // the next.
+      let firstError: string | null = null;
+
+      if (!trimmedTitle) {
+        const msg = "Title is required.";
+        setTitleError(msg);
+        firstError = firstError ?? msg;
+      } else if (trimmedTitle.length > TITLE_MAX) {
+        const msg = `Title must be ${TITLE_MAX} characters or fewer.`;
+        setTitleError(msg);
+        firstError = firstError ?? msg;
+      } else {
+        setTitleError(null);
+      }
+
+      if (description.length > DESCRIPTION_MAX) {
+        const msg = `Description must be ${DESCRIPTION_MAX.toLocaleString()} characters or fewer.`;
+        setDescriptionError(msg);
+        firstError = firstError ?? msg;
+      } else {
+        setDescriptionError(null);
+      }
+
+      if (firstError) return;
+
+      // Normalize the optional fields so the wire shape matches the server
+      // contract: `description` becomes null when blank/whitespace only,
+      // `assigneeId` becomes null for the "Unassigned" sentinel.
+      const trimmedDescription = description.trim();
+      const payload = {
+        title: trimmedTitle,
+        description: trimmedDescription === "" ? null : trimmedDescription,
+        assigneeId:
+          assigneeId === UNASSIGNED_VALUE ? null : assigneeId,
+      };
+
+      setSaving(true);
+      try {
+        const data = await apiClient.put<UpdateTaskResponse>(
+          `/api/tasks/${task.id}`,
+          payload,
+          { silent: true, skipAuthRedirect: true },
+        );
+
+        toast.success("Updated", {
+          description: `“${data.task.title}” has been updated.`,
+        });
+        onSaved(data.task);
+      } catch (err) {
+        if (err instanceof ApiError) {
+          // 422 INVALID_INPUT comes back when the assignee isn't a team
+          // member (concurrent membership change between dialog-open and
+          // submit). Surface the server's human-readable message rather
+          // than guessing at a localized one.
+          if (err.status === 422) {
+            toast.error("Couldn't update task", { description: err.message });
+          } else if (err.code === "INVALID_INPUT") {
+            // 400 INVALID_INPUT typically means a field failed server-side
+            // re-validation (e.g. unicode-only title that trims to empty).
+            // Pin it to the title field — that's the most likely culprit.
+            setTitleError(err.message);
+            toast.error("Couldn't update task", { description: err.message });
+          } else if (err.status === 404) {
+            // The task was deleted out from under us. Surface a toast and
+            // bail back to view-mode; the parent's load path will pick up
+            // the deletion on its next refresh.
+            toast.error("Task no longer exists", { description: err.message });
+          } else {
+            toast.error("Couldn't update task", { description: err.message });
+          }
+        } else {
+          toast.error("Couldn't update task", {
+            description: "Something went wrong. Please try again.",
+          });
+        }
+      } finally {
+        setSaving(false);
+      }
+    },
+    [
+      assigneeId,
+      description,
+      onSaved,
+      saving,
+      setSaving,
+      task.id,
+      trimmedTitle,
+    ],
+  );
+
+  const onAssigneeChange = useCallback(
+    (event: ChangeEvent<HTMLSelectElement>) => {
+      setAssigneeId(event.target.value);
+    },
+    [],
+  );
+
+  return (
+    <>
+      <DialogHeader>
+        <DialogTitle>Edit task</DialogTitle>
+        <DialogDescription>
+          Update the title, description, or assignee. Changes are saved when
+          you click Save.
+        </DialogDescription>
+      </DialogHeader>
+
+      <form className="space-y-4" onSubmit={onSubmit} noValidate>
+        {/* ---------- Title ---------- */}
+        <div className="space-y-2">
+          <Label htmlFor={titleInputId}>
+            Title <span aria-hidden="true">*</span>
+            <span className="sr-only">(required)</span>
+          </Label>
+          <Input
+            id={titleInputId}
+            name="title"
+            type="text"
+            autoComplete="off"
+            autoFocus
+            maxLength={TITLE_MAX}
+            placeholder="What needs to get done?"
+            value={title}
+            onChange={(event) => {
+              setTitle(event.target.value);
+              if (titleError) setTitleError(null);
+            }}
+            aria-invalid={Boolean(titleError)}
+            aria-describedby={titleError ? titleErrorId : undefined}
+            disabled={saving}
+            required
+          />
+          <div className="flex items-center justify-end text-xs text-muted-foreground">
+            <span aria-live="polite">
+              {trimmedTitleLength}/{TITLE_MAX}
+            </span>
+          </div>
+          {titleError ? (
+            <p
+              id={titleErrorId}
+              className="text-sm text-destructive"
+              role="alert"
+            >
+              {titleError}
+            </p>
+          ) : null}
+        </div>
+
+        {/* ---------- Description ---------- */}
+        <div className="space-y-2">
+          <Label htmlFor={descriptionInputId}>
+            Description{" "}
+            <span className="font-normal text-muted-foreground">
+              (optional)
+            </span>
+          </Label>
+          <Textarea
+            id={descriptionInputId}
+            name="description"
+            maxLength={DESCRIPTION_MAX}
+            placeholder="Add more context, links, acceptance criteria…"
+            value={description}
+            onChange={(event) => {
+              setDescription(event.target.value);
+              if (descriptionError) setDescriptionError(null);
+            }}
+            aria-invalid={Boolean(descriptionError)}
+            aria-describedby={cn(
+              descriptionHintId,
+              descriptionError && descriptionErrorId,
+            )
+              .trim()
+              .replace(/\s+/g, " ")}
+            disabled={saving}
+            rows={5}
+          />
+          <div
+            id={descriptionHintId}
+            className="flex items-center justify-between gap-2 text-xs text-muted-foreground"
+          >
+            <span>Markdown supported.</span>
+            <span aria-live="polite">
+              {descriptionLength.toLocaleString()}/
+              {DESCRIPTION_MAX.toLocaleString()}
+            </span>
+          </div>
+          {descriptionError ? (
+            <p
+              id={descriptionErrorId}
+              className="text-sm text-destructive"
+              role="alert"
+            >
+              {descriptionError}
+            </p>
+          ) : null}
+        </div>
+
+        {/* ---------- Assignee ---------- */}
+        <div className="space-y-2">
+          <Label htmlFor={assigneeInputId}>
+            Assignee{" "}
+            <span className="font-normal text-muted-foreground">
+              (optional)
+            </span>
+          </Label>
+          <select
+            id={assigneeInputId}
+            name="assigneeId"
+            value={assigneeId}
+            onChange={onAssigneeChange}
+            disabled={saving}
+            className={cn(
+              "flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm",
+              "ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+              "disabled:cursor-not-allowed disabled:opacity-50",
+            )}
+          >
+            <option value={UNASSIGNED_VALUE}>Unassigned</option>
+            {showCurrentAssigneeFallback && task.assignee ? (
+              <option value={task.assignee.id}>
+                {task.assignee.name ?? task.assignee.email}
+                {task.assignee.name ? ` · ${task.assignee.email}` : ""}
+                {" (current)"}
+              </option>
+            ) : null}
+            {sortedMembers.map((member) => (
+              <option key={member.userId} value={member.userId}>
+                {member.name ?? member.email}
+                {member.name ? ` · ${member.email}` : ""}
+              </option>
+            ))}
+          </select>
+          {sortedMembers.length === 0 && !showCurrentAssigneeFallback ? (
+            <p className="text-xs text-muted-foreground">
+              No team members are available to assign yet.
+            </p>
+          ) : null}
+        </div>
+
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={onCancel}
+            disabled={saving}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="submit"
+            disabled={saving || trimmedTitleLength === 0}
+          >
+            {saving ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                Saving…
+              </>
+            ) : (
+              <>Save</>
+            )}
+          </Button>
+        </DialogFooter>
+      </form>
     </>
   );
 }
