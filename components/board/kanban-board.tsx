@@ -782,6 +782,7 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
             if (!next) setAddTaskColumnId(null);
           }}
           projectId={project.id}
+          teamId={teamId}
           columnId={addTaskColumn.id}
           columnName={addTaskColumn.name}
           members={teamMembers}
@@ -807,6 +808,7 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
         taskId={detailTaskId}
         canEdit={isMember}
         members={teamMembers}
+        teamId={teamId}
         onUpdated={handleTaskUpdated}
         onDeleted={handleTaskDeleted}
       />

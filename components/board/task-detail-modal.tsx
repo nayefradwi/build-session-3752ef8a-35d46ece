@@ -6,7 +6,6 @@ import {
   useId,
   useMemo,
   useState,
-  type ChangeEvent,
   type FormEvent,
 } from "react";
 import {
@@ -27,6 +26,10 @@ import { toast } from "sonner";
 
 import { ApiError, apiClient } from "@/lib/client/api-client";
 import { cn } from "@/lib/client/utils";
+import {
+  AssigneeSelect,
+  type AssigneeMember,
+} from "@/components/board/assignee-select";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button, buttonVariants } from "@/components/ui/button";
 import {
@@ -118,12 +121,6 @@ type UpdateTaskResponse = { task: UpdatedTask };
 const TITLE_MAX = 200;
 const DESCRIPTION_MAX = 10_000;
 
-/** Sentinel value for the "Unassigned" option in the native select. The
- *  empty string can't appear as a real userId, so we encode "no assignee"
- *  with this and translate to `null` on submit. Mirrors the pattern in
- *  `add-task-dialog.tsx`. */
-const UNASSIGNED_VALUE = "__unassigned__";
-
 /* -------------------------------------------------------------------------- */
 /*                                  Helpers                                   */
 /* -------------------------------------------------------------------------- */
@@ -198,10 +195,19 @@ export type TaskDetailModalProps = {
    * Members of the owning team, surfaced in the assignee dropdown of the
    * edit form. The server enforces that the assignee must be a team member,
    * so the dropdown is restricted to this list. Optional — when absent, the
-   * dropdown only offers "Unassigned" plus (if currently assigned) the
-   * existing assignee, so the user can at least clear a stale assignment.
+   * AssigneeSelect falls back to fetching `/api/teams/[teamId]/members` on
+   * its own (provided `teamId` is supplied) so the dropdown stays usable.
    */
   members?: AddTaskTeamMember[];
+  /**
+   * Owning team id. Forwarded to the in-modal {@link AssigneeSelect} so it
+   * can fall back to fetching the membership roster from
+   * `/api/teams/[teamId]/members` when `members` isn't preloaded by the
+   * caller. Optional — the assignee picker degrades gracefully without it,
+   * but a missing teamId AND missing members combination leaves the dropdown
+   * with only the "Unassign" affordance + current assignee fallback.
+   */
+  teamId?: string;
   /**
    * Called with the freshly-saved task on a successful edit. The caller is
    * expected to splice the update into its local board state so the
@@ -266,6 +272,7 @@ export function TaskDetailModal({
   taskId,
   canEdit = false,
   members,
+  teamId,
   onUpdated,
   onDeleted,
 }: TaskDetailModalProps) {
@@ -481,6 +488,7 @@ export function TaskDetailModal({
             <TaskDetailEditForm
               task={task}
               members={members ?? []}
+              teamId={teamId}
               saving={saving}
               setSaving={setSaving}
               onCancel={() => setEditing(false)}
@@ -756,6 +764,7 @@ function TaskDetailBody({
 function TaskDetailEditForm({
   task,
   members,
+  teamId,
   saving,
   setSaving,
   onCancel,
@@ -763,6 +772,7 @@ function TaskDetailEditForm({
 }: {
   task: TaskDetail;
   members: AddTaskTeamMember[];
+  teamId?: string;
   saving: boolean;
   setSaving: (saving: boolean) => void;
   onCancel: () => void;
@@ -777,8 +787,10 @@ function TaskDetailEditForm({
 
   const [title, setTitle] = useState(task.title);
   const [description, setDescription] = useState(task.description ?? "");
-  const [assigneeId, setAssigneeId] = useState<string>(
-    task.assignee?.id ?? UNASSIGNED_VALUE,
+  // `null` means "Unassigned" — the AssigneeSelect handles the sentinel
+  // translation internally, so this state matches the wire shape exactly.
+  const [assigneeId, setAssigneeId] = useState<string | null>(
+    task.assignee?.id ?? null,
   );
   const [titleError, setTitleError] = useState<string | null>(null);
   const [descriptionError, setDescriptionError] = useState<string | null>(null);
@@ -787,28 +799,36 @@ function TaskDetailEditForm({
   const trimmedTitleLength = trimmedTitle.length;
   const descriptionLength = description.length;
 
-  // Sorted members for the dropdown: name (case-insensitive) then email so
-  // the list reads the same way on every open. Memoized — sorting on every
-  // keystroke would churn the option list and reset the user's select focus.
-  const sortedMembers = useMemo(() => {
-    const copy = [...members];
-    copy.sort((a, b) => {
-      const an = (a.name ?? "").toLowerCase();
-      const bn = (b.name ?? "").toLowerCase();
-      if (an !== bn) return an < bn ? -1 : 1;
-      return a.email < b.email ? -1 : a.email > b.email ? 1 : 0;
-    });
-    return copy;
-  }, [members]);
+  // Convert the parent's team-roster shape (keyed by `userId`) into the
+  // {@link AssigneeMember} shape (keyed by `id`) that the shared
+  // `AssigneeSelect` consumes. Memoized so a parent re-render doesn't churn
+  // the option list reference and reset the dropdown's internal focus.
+  const assigneeMembers = useMemo<AssigneeMember[]>(
+    () =>
+      members.map((m) => ({
+        id: m.userId,
+        name: m.name,
+        email: m.email,
+      })),
+    [members],
+  );
 
-  // If the current assignee isn't in the supplied roster, surface them as
-  // an additional option so the user's existing pick stays representable.
-  // (Without this, a missing roster would silently unassign on save: the
-  // <select> would fall through to "Unassigned" because the assigneeId
-  // value wouldn't match any rendered option.)
-  const showCurrentAssigneeFallback =
-    task.assignee !== null &&
-    !sortedMembers.some((m) => m.userId === task.assignee?.id);
+  // The current saved assignee, expressed in the shape AssigneeSelect needs
+  // for its "current assignee not in roster" fallback. Without this, a stale
+  // roster (member removed between dialog-open and now) would visually flip
+  // the trigger to "Unassigned" while `assigneeId` stayed pointed at the
+  // missing user — silently misleading the next save.
+  const currentAssignee = useMemo<AssigneeMember | null>(
+    () =>
+      task.assignee
+        ? {
+            id: task.assignee.id,
+            name: task.assignee.name,
+            email: task.assignee.email,
+          }
+        : null,
+    [task.assignee],
+  );
 
   const onSubmit = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
@@ -844,13 +864,13 @@ function TaskDetailEditForm({
 
       // Normalize the optional fields so the wire shape matches the server
       // contract: `description` becomes null when blank/whitespace only,
-      // `assigneeId` becomes null for the "Unassigned" sentinel.
+      // `assigneeId` is already `string | null` thanks to the AssigneeSelect's
+      // own translation of its "Unassigned" sentinel.
       const trimmedDescription = description.trim();
       const payload = {
         title: trimmedTitle,
         description: trimmedDescription === "" ? null : trimmedDescription,
-        assigneeId:
-          assigneeId === UNASSIGNED_VALUE ? null : assigneeId,
+        assigneeId,
       };
 
       setSaving(true);
@@ -905,13 +925,6 @@ function TaskDetailEditForm({
       task.id,
       trimmedTitle,
     ],
-  );
-
-  const onAssigneeChange = useCallback(
-    (event: ChangeEvent<HTMLSelectElement>) => {
-      setAssigneeId(event.target.value);
-    },
-    [],
   );
 
   return (
@@ -1022,38 +1035,26 @@ function TaskDetailEditForm({
               (optional)
             </span>
           </Label>
-          <select
-            id={assigneeInputId}
-            name="assigneeId"
-            value={assigneeId}
-            onChange={onAssigneeChange}
-            disabled={saving}
-            className={cn(
-              "flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm",
-              "ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
-              "disabled:cursor-not-allowed disabled:opacity-50",
-            )}
-          >
-            <option value={UNASSIGNED_VALUE}>Unassigned</option>
-            {showCurrentAssigneeFallback && task.assignee ? (
-              <option value={task.assignee.id}>
-                {task.assignee.name ?? task.assignee.email}
-                {task.assignee.name ? ` · ${task.assignee.email}` : ""}
-                {" (current)"}
-              </option>
-            ) : null}
-            {sortedMembers.map((member) => (
-              <option key={member.userId} value={member.userId}>
-                {member.name ?? member.email}
-                {member.name ? ` · ${member.email}` : ""}
-              </option>
-            ))}
-          </select>
-          {sortedMembers.length === 0 && !showCurrentAssigneeFallback ? (
+          {teamId ? (
+            <AssigneeSelect
+              id={assigneeInputId}
+              teamId={teamId}
+              members={assigneeMembers}
+              currentAssignee={currentAssignee}
+              value={assigneeId}
+              onChange={setAssigneeId}
+              disabled={saving}
+            />
+          ) : (
+            // Defensive fallback: if the parent didn't pass a teamId, the
+            // AssigneeSelect can't fetch on its own and we'd be stuck without
+            // a roster to render. Surface a hint rather than a broken
+            // dropdown — saving the form still works (the existing assignee
+            // is preserved by `assigneeId` state).
             <p className="text-xs text-muted-foreground">
-              No team members are available to assign yet.
+              Assignee picker unavailable — team context missing.
             </p>
-          ) : null}
+          )}
         </div>
 
         <DialogFooter>

@@ -6,7 +6,6 @@ import {
   useId,
   useMemo,
   useState,
-  type ChangeEvent,
   type FormEvent,
 } from "react";
 import { Loader2, Plus } from "lucide-react";
@@ -14,6 +13,7 @@ import { toast } from "sonner";
 
 import { ApiError, apiClient } from "@/lib/client/api-client";
 import { cn } from "@/lib/client/utils";
+import { AssigneeSelect, type AssigneeMember } from "@/components/board/assignee-select";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -39,11 +39,6 @@ import type { BoardTask, BoardTaskAssignee } from "@/components/board/types";
  */
 const TITLE_MAX = 200;
 const DESCRIPTION_MAX = 10_000;
-
-/** Sentinel value for the "Unassigned" option in the native select. The
- *  empty string can't appear as a real userId, so we encode "no assignee"
- *  with this and translate to `null` on submit. */
-const UNASSIGNED_VALUE = "__unassigned__";
 
 /** Mirrors the response body of `POST /api/projects/[projectId]/tasks`. */
 type CreatedTask = {
@@ -74,6 +69,10 @@ export type AddTaskDialogProps = {
   onOpenChange: (open: boolean) => void;
   /** Resolved project id — required to know which board to POST against. */
   projectId: string;
+  /** Owning team id — forwarded to the {@link AssigneeSelect} so it can
+   *  fall back to fetching `/api/teams/[teamId]/members` if the parent
+   *  hasn't preloaded a roster. */
+  teamId: string;
   /** Column the task is being added to. The submit POSTs `{ columnId }` so
    *  the server can scope the position lookup + lock to the right lane. */
   columnId: string;
@@ -118,6 +117,7 @@ export function AddTaskDialog({
   open,
   onOpenChange,
   projectId,
+  teamId,
   columnId,
   columnName,
   members,
@@ -132,7 +132,9 @@ export function AddTaskDialog({
 
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
-  const [assigneeId, setAssigneeId] = useState<string>(UNASSIGNED_VALUE);
+  // `null` means "Unassigned" — the AssigneeSelect handles the sentinel
+  // translation internally, so we only ever store the real wire shape here.
+  const [assigneeId, setAssigneeId] = useState<string | null>(null);
   const [titleError, setTitleError] = useState<string | null>(null);
   const [descriptionError, setDescriptionError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -141,7 +143,7 @@ export function AddTaskDialog({
     if (!open) {
       setTitle("");
       setDescription("");
-      setAssigneeId(UNASSIGNED_VALUE);
+      setAssigneeId(null);
       setTitleError(null);
       setDescriptionError(null);
       setSubmitting(false);
@@ -154,26 +156,26 @@ export function AddTaskDialog({
   // selected assignee to "unassigned" so we don't carry over a pick that
   // belonged to a different context.
   useEffect(() => {
-    if (open) setAssigneeId(UNASSIGNED_VALUE);
+    if (open) setAssigneeId(null);
   }, [columnId, open]);
 
   const trimmedTitle = useMemo(() => title.trim(), [title]);
   const trimmedTitleLength = trimmedTitle.length;
   const descriptionLength = description.length;
 
-  // Sorted members for the dropdown: name (case-insensitive) then email so
-  // the list reads the same way on every open. Memoized — sorting on every
-  // keystroke would churn the option list and reset the user's select focus.
-  const sortedMembers = useMemo(() => {
-    const copy = [...members];
-    copy.sort((a, b) => {
-      const an = (a.name ?? "").toLowerCase();
-      const bn = (b.name ?? "").toLowerCase();
-      if (an !== bn) return an < bn ? -1 : 1;
-      return a.email < b.email ? -1 : a.email > b.email ? 1 : 0;
-    });
-    return copy;
-  }, [members]);
+  // Convert the parent's team-roster shape (keyed by `userId`) into the
+  // {@link AssigneeMember} shape (keyed by `id`) that the shared
+  // `AssigneeSelect` expects. Memoized so a cosmetic re-render of the parent
+  // doesn't churn the option list reference.
+  const assigneeMembers = useMemo<AssigneeMember[]>(
+    () =>
+      members.map((m) => ({
+        id: m.userId,
+        name: m.name,
+        email: m.email,
+      })),
+    [members],
+  );
 
   const onSubmit = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
@@ -209,14 +211,14 @@ export function AddTaskDialog({
 
       // Normalize the optional fields so the wire shape matches the server
       // contract: `description` becomes null when blank/whitespace only,
-      // `assigneeId` becomes null for the "Unassigned" sentinel.
+      // `assigneeId` is already `string | null` thanks to the AssigneeSelect's
+      // own translation of its "Unassigned" sentinel.
       const trimmedDescription = description.trim();
       const payload = {
         columnId,
         title: trimmedTitle,
         description: trimmedDescription === "" ? null : trimmedDescription,
-        assigneeId:
-          assigneeId === UNASSIGNED_VALUE ? null : assigneeId,
+        assigneeId,
       };
 
       setSubmitting(true);
@@ -283,13 +285,6 @@ export function AddTaskDialog({
       submitting,
       trimmedTitle,
     ],
-  );
-
-  const onAssigneeChange = useCallback(
-    (event: ChangeEvent<HTMLSelectElement>) => {
-      setAssigneeId(event.target.value);
-    },
-    [],
   );
 
   return (
@@ -408,31 +403,14 @@ export function AddTaskDialog({
                 (optional)
               </span>
             </Label>
-            <select
+            <AssigneeSelect
               id={assigneeInputId}
-              name="assigneeId"
+              teamId={teamId}
+              members={assigneeMembers}
               value={assigneeId}
-              onChange={onAssigneeChange}
+              onChange={setAssigneeId}
               disabled={submitting}
-              className={cn(
-                "flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm",
-                "ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
-                "disabled:cursor-not-allowed disabled:opacity-50",
-              )}
-            >
-              <option value={UNASSIGNED_VALUE}>Unassigned</option>
-              {sortedMembers.map((member) => (
-                <option key={member.userId} value={member.userId}>
-                  {member.name ?? member.email}
-                  {member.name ? ` · ${member.email}` : ""}
-                </option>
-              ))}
-            </select>
-            {sortedMembers.length === 0 ? (
-              <p className="text-xs text-muted-foreground">
-                No team members are available to assign yet.
-              </p>
-            ) : null}
+            />
           </div>
 
           <DialogFooter>
