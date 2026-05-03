@@ -13,12 +13,21 @@ import {
   CalendarClock,
   CalendarPlus,
   Download,
+  File as FileIcon,
+  FileArchive,
+  FileAudio,
+  FileCode,
+  FileImage,
+  FileJson,
+  FileSpreadsheet,
   FileText,
+  FileVideo,
   Loader2,
   Paperclip,
   Pencil,
   RefreshCw,
   Trash2,
+  type LucideIcon,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -69,11 +78,10 @@ import type { BoardTask } from "@/components/board/types";
  * Mirrors the response of `GET /api/tasks/[taskId]`.
  *
  * The handler inlines an `assignee` slice (`{ id, name, email }`) when one is
- * set — `null` otherwise — and ships an `attachments` array. The attachments
- * field is reserved on the wire and currently always empty (the storage
- * driver hasn't been wired up to expose it on this read path yet), but we
- * type the shape now so the modal renders the list as soon as the route
- * starts populating it without any client-side change.
+ * set — `null` otherwise — and ships an `attachments` array describing the
+ * files persisted against the task. Each attachment can be downloaded via
+ * `GET /api/attachments/[attachmentId]`; the modal renders that as a link
+ * row with a MIME-mapped icon, filename, and size — see {@link AttachmentRow}.
  */
 type TaskDetailAssignee = {
   id: string;
@@ -169,6 +177,79 @@ const formatFileSize = (bytes: number): string => {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+};
+
+/**
+ * Pick a lucide-react icon for an attachment row based on its MIME type.
+ *
+ * Strategy: match the broad media-type prefix first (image/video/audio/text),
+ * then fall back to a small whitelist of commonly-uploaded application/*
+ * subtypes (archives, code, spreadsheets, json, pdf). Anything we don't
+ * recognise gets the generic {@link FileIcon} so the row always renders an
+ * icon — never an empty slot.
+ *
+ * The whitelist intentionally mirrors the MIME types the upload endpoint
+ * accepts so every attachment that successfully made it into the DB resolves
+ * to a meaningful glyph; we still keep the generic fallback for forward-
+ * compatibility with new types added on the server side without a UI change.
+ */
+const iconForMimeType = (mimeType: string): LucideIcon => {
+  // Normalise to lower-case so a `Image/PNG` from a misbehaving uploader
+  // still hits the prefix match. We split on `;` so parameter-laden types
+  // like `text/plain; charset=utf-8` collapse to just `text/plain` for the
+  // exact-match branches below.
+  const normalised = mimeType.toLowerCase().split(";", 1)[0].trim();
+
+  if (normalised.startsWith("image/")) return FileImage;
+  if (normalised.startsWith("video/")) return FileVideo;
+  if (normalised.startsWith("audio/")) return FileAudio;
+
+  // Specific subtypes get a more precise glyph than the generic text/* one.
+  switch (normalised) {
+    case "application/pdf":
+      // No dedicated lucide PDF glyph; FileText reads as "document" and is
+      // the closest visual match.
+      return FileText;
+    case "application/json":
+    case "application/ld+json":
+      return FileJson;
+    case "application/zip":
+    case "application/x-zip-compressed":
+    case "application/x-tar":
+    case "application/gzip":
+    case "application/x-gzip":
+    case "application/x-7z-compressed":
+    case "application/x-rar-compressed":
+    case "application/vnd.rar":
+      return FileArchive;
+    case "application/vnd.ms-excel":
+    case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+    case "application/vnd.oasis.opendocument.spreadsheet":
+    case "text/csv":
+    case "text/tab-separated-values":
+      return FileSpreadsheet;
+    case "application/javascript":
+    case "application/x-javascript":
+    case "application/typescript":
+    case "application/xml":
+    case "application/x-sh":
+    case "application/x-yaml":
+    case "text/javascript":
+    case "text/x-python":
+    case "text/x-c":
+    case "text/x-java-source":
+    case "text/html":
+    case "text/css":
+    case "text/xml":
+    case "text/yaml":
+      return FileCode;
+  }
+
+  // Plain text falls through to the prefix match here, after the more
+  // specific text/* subtypes above have had a chance.
+  if (normalised.startsWith("text/")) return FileText;
+
+  return FileIcon;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -1205,34 +1286,69 @@ function AssigneeRow({ assignee }: { assignee: TaskDetailAssignee }) {
 /**
  * Single attachment row.
  *
- * The wire shape includes id, filename, mimeType, size, and createdAt — but
- * not a URL: the API has not yet exposed a download endpoint for attachments
- * (the GET handler hard-codes an empty list as of this writing). To keep the
- * UI ready for the day the route lights up, we render the row as an anchor
- * pointing at the conventional location (`/api/attachments/[id]`); the
- * attribute is harmless until the route exists since the list itself stays
- * empty in production.
+ * Rendered as an anchor pointing at `GET /api/attachments/[attachmentId]`
+ * (see `app/api/attachments/[attachmentId]/route.ts`). Downloads are forced
+ * server-side via a `Content-Disposition: attachment` header carrying the
+ * original filename (RFC 6266 quoted-string + RFC 5987 UTF-8 extended form),
+ * so the bytes always save to disk rather than rendering inline regardless
+ * of the user-agent's MIME-handling defaults.
+ *
+ * We additionally set the HTML `download` attribute on the anchor as a
+ * client-side hint:
+ *
+ *   - It nudges browsers that haven't parsed the response headers yet to
+ *     treat the navigation as a download — a useful belt-and-braces given
+ *     the link is same-origin (so the attribute is honoured without the
+ *     cross-origin restriction documented on MDN).
+ *   - The attribute value carries the filename so even browsers that
+ *     ignore the server's `filename*=UTF-8''…` extended form still land on
+ *     the original name. The server's header is the source of truth; this
+ *     is a fallback.
+ *
+ * We deliberately drop `target="_blank"` here: combining it with the
+ * `download` attribute is a known foot-gun (some browsers race the new tab
+ * against the download and end up doing both), and a streamed `attachment`
+ * response never replaces the current page anyway — the browser handles it
+ * out-of-band — so opening a new tab buys us nothing.
+ *
+ * Iconography:
+ *   - The leading icon is mapped from the attachment's stored MIME type via
+ *     {@link iconForMimeType} (image / video / audio / archive / code /
+ *     spreadsheet / json / text / generic), so the row at-a-glance hints at
+ *     content shape without the user having to read the type string.
+ *   - The trailing {@link Download} icon is purely an affordance hint: it
+ *     reinforces that activating the row downloads bytes rather than opening
+ *     a preview surface.
  */
 function AttachmentRow({ attachment }: { attachment: TaskDetailAttachment }) {
+  const TypeIcon = iconForMimeType(attachment.mimeType);
   return (
     <a
       href={`/api/attachments/${attachment.id}`}
-      // We don't know the storage backend's response shape yet, so let the
-      // browser handle the redirect/download natively without forcing a
-      // download attribute (which can fight signed-URL redirects).
-      target="_blank"
+      // The server's Content-Disposition is the source of truth for the
+      // saved filename; `download={filename}` is the client-side fallback
+      // for browsers that don't fully parse the RFC 5987 extended form.
+      download={attachment.filename}
+      // Same-origin link, so `noopener noreferrer` is defensive overkill —
+      // but cheap, and consistent with the rest of the modal's outbound
+      // anchor styling.
       rel="noopener noreferrer"
       className={cn(
         "flex items-center gap-3 px-3 py-2 text-sm",
         "transition-colors hover:bg-muted focus-visible:outline-none focus-visible:bg-muted",
       )}
-      aria-label={`Download ${attachment.filename}`}
+      aria-label={`Download ${attachment.filename} (${formatFileSize(attachment.size)})`}
     >
-      <FileText className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+      <TypeIcon
+        className="h-4 w-4 shrink-0 text-muted-foreground"
+        aria-hidden="true"
+      />
       <div className="min-w-0 flex-1">
         <p className="truncate font-medium">{attachment.filename}</p>
         <p className="truncate text-xs text-muted-foreground">
-          {attachment.mimeType} · {formatFileSize(attachment.size)}
+          <span className="font-mono">{attachment.mimeType}</span>
+          {" · "}
+          {formatFileSize(attachment.size)}
         </p>
       </div>
       <Download
