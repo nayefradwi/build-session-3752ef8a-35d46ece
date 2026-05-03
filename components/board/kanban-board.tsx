@@ -437,6 +437,42 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
     });
   }, []);
 
+  // Sync-on-success for inline column renames. The PUT handler returns the
+  // freshly-updated column row (id/projectId/name/position); we swap it onto
+  // local state by id, preserving the existing `tasks` slice. Position can
+  // theoretically shift between renames if a sibling admin reorders columns
+  // mid-flight, so we re-sort defensively. We don't merge tasks from the
+  // server response because the rename endpoint doesn't touch them — the
+  // local task list is still authoritative.
+  const handleColumnRenamed = useCallback(
+    (column: { id: string; projectId: string; name: string; position: number }) => {
+      setColumns((prev) => {
+        let touched = false;
+        const next = prev.map((existing) => {
+          if (existing.id !== column.id) return existing;
+          if (
+            existing.name === column.name &&
+            existing.position === column.position &&
+            existing.projectId === column.projectId
+          ) {
+            return existing;
+          }
+          touched = true;
+          return {
+            ...existing,
+            projectId: column.projectId,
+            name: column.name,
+            position: column.position,
+          };
+        });
+        if (!touched) return prev;
+        next.sort((a, b) => a.position - b.position);
+        return next;
+      });
+    },
+    [],
+  );
+
   // Sync-on-success for task edits: the PUT handler returns the updated
   // task (including columnId/position, which the edit form doesn't touch
   // but we read defensively in case a future surface adds them). We swap
@@ -744,6 +780,7 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
           onRequestAddColumn={() => setAddColumnOpen(true)}
           onRequestAddTask={(columnId) => setAddTaskColumnId(columnId)}
           onSelectTask={(task) => setDetailTaskId(task.id)}
+          onColumnRenamed={handleColumnRenamed}
         />
         {/* The DragOverlay clone follows the cursor while a drag is in
             progress. We render a non-interactive `BoardTaskCard` (no
@@ -831,6 +868,12 @@ type BoardLayoutProps = {
   onRequestAddColumn: () => void;
   onRequestAddTask: (columnId: string) => void;
   onSelectTask: (task: BoardTask) => void;
+  onColumnRenamed: (column: {
+    id: string;
+    projectId: string;
+    name: string;
+    position: number;
+  }) => void;
 };
 
 function BoardLayout({
@@ -844,6 +887,7 @@ function BoardLayout({
   onRequestAddColumn,
   onRequestAddTask,
   onSelectTask,
+  onColumnRenamed,
 }: BoardLayoutProps) {
   // The drag-to-reorder gesture mirrors the server-side member check on
   // PATCH /api/tasks/[taskId]/move. Visitors of a public project can still
@@ -902,12 +946,14 @@ function BoardLayout({
 
       <BoardColumns
         columns={columns}
+        projectId={project?.id ?? null}
         isMember={isMember}
         isTeamAdmin={isTeamAdmin}
         onRequestAddColumn={onRequestAddColumn}
         onRequestAddTask={onRequestAddTask}
         onSelectTask={onSelectTask}
         canReorder={canReorder}
+        onColumnRenamed={onColumnRenamed}
       />
     </div>
   );
@@ -919,6 +965,12 @@ function BoardLayout({
 
 type BoardColumnsProps = {
   columns: BoardColumnData[];
+  /**
+   * Owning project id. May be null while the project fetch is still
+   * resolving — the rename affordance is only enabled once we have a
+   * concrete projectId to PUT against.
+   */
+  projectId: string | null;
   isMember: boolean;
   isTeamAdmin: boolean;
   onRequestAddColumn: () => void;
@@ -931,16 +983,24 @@ type BoardColumnsProps = {
    * read-only board but no drag affordance.
    */
   canReorder: boolean;
+  onColumnRenamed: (column: {
+    id: string;
+    projectId: string;
+    name: string;
+    position: number;
+  }) => void;
 };
 
 function BoardColumns({
   columns,
+  projectId,
   isMember,
   isTeamAdmin,
   onRequestAddColumn,
   onRequestAddTask,
   onSelectTask,
   canReorder,
+  onColumnRenamed,
 }: BoardColumnsProps) {
   if (columns.length === 0) {
     return (
@@ -990,6 +1050,12 @@ function BoardColumns({
             // task creation, since the move endpoint enforces the check
             // server-side anyway.
             canReorder={canReorder}
+            // Inline rename gate mirrors the server-side team-admin check
+            // on PUT /api/projects/[projectId]/columns/[columnId]. Tenant
+            // admins do NOT bypass; column management is team-scoped.
+            canEditName={isTeamAdmin}
+            projectId={projectId ?? undefined}
+            onRenamed={onColumnRenamed}
           />
         ))}
         {canAddColumn ? (

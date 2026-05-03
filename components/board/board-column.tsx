@@ -5,9 +5,11 @@ import {
   SortableContext,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
-import { Layers, Plus } from "lucide-react";
-import { useMemo } from "react";
+import { Layers, Pencil, Plus } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
 
+import { ApiError, apiClient } from "@/lib/client/api-client";
 import { cn } from "@/lib/client/utils";
 import { BoardTaskCard } from "@/components/board/board-task-card";
 import { SortableBoardTaskCard } from "@/components/board/sortable-task-card";
@@ -45,6 +47,34 @@ type BoardColumnProps = {
    * client-side rather than queuing a guaranteed-fail PATCH.
    */
   canReorder?: boolean;
+  /**
+   * When true, the column header becomes interactive: clicking it swaps the
+   * `<h2>` for an inline `<input>` so the admin can rename the column. On
+   * blur/Enter the new name is PUT to
+   * `/api/projects/[projectId]/columns/[columnId]`. Mirrors the server-side
+   * team-admin gate; tenant admins do NOT bypass (the endpoint enforces the
+   * same rule), so we only flip this on for team admins.
+   */
+  canEditName?: boolean;
+  /**
+   * Project id used to build the rename PUT path. Required when
+   * `canEditName` is true; the column itself only knows its own id +
+   * projectId-on-the-row, but we forward the projectId from the parent
+   * (rather than relying on `column.projectId`) for symmetry with the rest
+   * of the board's mutation callsites.
+   */
+  projectId?: string;
+  /**
+   * Splice-on-success callback for an inline rename. The PUT handler returns
+   * the updated column row; we forward the relevant fields so the parent can
+   * update its local board state without a full refetch.
+   */
+  onRenamed?: (column: {
+    id: string;
+    projectId: string;
+    name: string;
+    position: number;
+  }) => void;
 };
 
 /**
@@ -65,6 +95,9 @@ export function BoardColumn({
   onRequestAddTask,
   onSelectTask,
   canReorder = false,
+  canEditName = false,
+  projectId,
+  onRenamed,
 }: BoardColumnProps) {
   const taskCount = column.tasks.length;
 
@@ -115,11 +148,14 @@ export function BoardColumn({
       )}
     >
       <header className="flex items-center justify-between gap-2 px-1">
-        <h2 className="truncate text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-          {column.name}
-        </h2>
+        <ColumnHeaderTitle
+          column={column}
+          canEditName={canEditName && Boolean(projectId)}
+          projectId={projectId}
+          onRenamed={onRenamed}
+        />
         <span
-          className="inline-flex h-5 min-w-[1.25rem] items-center justify-center rounded-full bg-background px-1.5 text-xs font-medium text-muted-foreground"
+          className="inline-flex h-5 min-w-[1.25rem] shrink-0 items-center justify-center rounded-full bg-background px-1.5 text-xs font-medium text-muted-foreground"
           aria-hidden="true"
         >
           {taskCount}
@@ -155,6 +191,242 @@ export function BoardColumn({
         />
       ) : null}
     </section>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                          Column header / inline rename                     */
+/* -------------------------------------------------------------------------- */
+
+type ColumnRenameResponse = {
+  column: {
+    id: string;
+    projectId: string;
+    name: string;
+    position: number;
+  };
+};
+
+/**
+ * Column-header title with inline rename for team admins.
+ *
+ *   - Read mode: a static `<h2>` styled identically to the previous static
+ *     header, but wrapped in a button-like trigger when `canEditName` is true.
+ *     A subtle pencil icon appears on hover (and on keyboard focus) as the
+ *     "click to edit" affordance — invisible by default so non-admins (and
+ *     idle admins) get the original chrome-free look.
+ *   - Edit mode: swaps the title for an `<input>` pre-populated with the
+ *     current name, autofocused + text-selected so an admin can immediately
+ *     type a replacement or chip away at the existing label.
+ *   - Commit triggers: blur OR Enter. Whitespace-only / empty input reverts
+ *     to the previous name (no PUT). Unchanged input also short-circuits the
+ *     PUT — we only round-trip when the trimmed value differs from the
+ *     current name.
+ *   - Cancel trigger: Escape reverts and exits edit mode without a save.
+ *   - During the in-flight PUT the input is disabled and read-only-styled so
+ *     a fast double-Enter doesn't fire a duplicate request.
+ *   - On any error (404 / 403 / 5xx / network) we revert the optimistic
+ *     local state and surface the message via sonner. The parent stays on
+ *     the truth-of-the-server `column.name` until the parent's `onRenamed`
+ *     callback succeeds.
+ */
+function ColumnHeaderTitle({
+  column,
+  canEditName,
+  projectId,
+  onRenamed,
+}: {
+  column: BoardColumnData;
+  canEditName: boolean;
+  projectId: string | undefined;
+  onRenamed?: (column: {
+    id: string;
+    projectId: string;
+    name: string;
+    position: number;
+  }) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(column.name);
+  const [submitting, setSubmitting] = useState(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  // Guard so blur-after-Enter doesn't double-submit. `commit()` already
+  // short-circuits on `submitting`, but Enter immediately blurs the input
+  // (we call `.blur()` on the keydown handler) which would otherwise re-enter
+  // the commit path with stale local state.
+  const committedRef = useRef(false);
+
+  // Re-sync the draft when the column's authoritative name shifts under us
+  // (sibling admin landed a rename, full board refetch, etc.) AND we're not
+  // currently mid-edit. Editing locally always wins until the user commits
+  // or cancels.
+  useEffect(() => {
+    if (!editing) {
+      setDraft(column.name);
+    }
+  }, [column.name, editing]);
+
+  // Autofocus + select-all when entering edit mode so the admin can either
+  // type a full replacement or arrow-key into the existing label without an
+  // extra click.
+  useEffect(() => {
+    if (editing && inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.select();
+    }
+  }, [editing]);
+
+  const beginEdit = () => {
+    if (!canEditName || submitting) return;
+    committedRef.current = false;
+    setDraft(column.name);
+    setEditing(true);
+  };
+
+  const cancelEdit = () => {
+    committedRef.current = true;
+    setDraft(column.name);
+    setEditing(false);
+  };
+
+  const commit = async () => {
+    if (committedRef.current) return;
+    committedRef.current = true;
+
+    const trimmed = draft.trim();
+
+    // Empty / whitespace-only: revert to the previous name without firing a
+    // PUT. The server would reject it as INVALID_INPUT anyway, and the spec
+    // calls out this exact behavior ("revert to previous name if empty").
+    if (trimmed.length === 0) {
+      setDraft(column.name);
+      setEditing(false);
+      return;
+    }
+
+    // No change: short-circuit so we don't churn the database for a
+    // round-trip that produces the same row back.
+    if (trimmed === column.name) {
+      setDraft(column.name);
+      setEditing(false);
+      return;
+    }
+
+    if (!projectId) {
+      // Defensive: parent should not enable rename without a projectId, but
+      // if it slips through we fall back to a clean revert rather than a
+      // broken PUT path.
+      setDraft(column.name);
+      setEditing(false);
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      const response = await apiClient.put<ColumnRenameResponse>(
+        `/api/projects/${projectId}/columns/${column.id}`,
+        { name: trimmed },
+        { silent: true, skipAuthRedirect: false },
+      );
+      // Forward the server's authoritative row to the parent so its column
+      // map updates in lockstep. Local draft also re-syncs via the
+      // column.name effect once the parent's state lands.
+      onRenamed?.(response.column);
+      setEditing(false);
+    } catch (err) {
+      const description =
+        err instanceof ApiError
+          ? err.message
+          : "We couldn't rename that column. Please try again.";
+      toast.error("Couldn't rename column", { description });
+      // Roll back the draft to the last-known authoritative name so the
+      // admin sees the pre-edit state, then drop out of edit mode. (Staying
+      // in edit mode after a 403/404 would just funnel the same error.)
+      setDraft(column.name);
+      setEditing(false);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (editing) {
+    return (
+      <label className="min-w-0 flex-1">
+        <span className="sr-only">Rename {column.name} column</span>
+        <input
+          ref={inputRef}
+          type="text"
+          value={draft}
+          maxLength={120}
+          disabled={submitting}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={() => {
+            void commit();
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              // Blur drives the actual commit (which avoids double-firing
+              // because `committedRef` is checked at the top of `commit`).
+              // Fall through to commit directly here too in case some host
+              // browser swallows the blur event.
+              e.currentTarget.blur();
+              if (!committedRef.current) {
+                void commit();
+              }
+            } else if (e.key === "Escape") {
+              e.preventDefault();
+              cancelEdit();
+            }
+          }}
+          aria-label={`Rename ${column.name} column`}
+          className={cn(
+            "h-7 w-full rounded-md border border-input bg-background px-2 text-sm font-semibold uppercase tracking-wide text-foreground",
+            "ring-offset-background placeholder:text-muted-foreground",
+            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+            "disabled:cursor-not-allowed disabled:opacity-60",
+          )}
+        />
+      </label>
+    );
+  }
+
+  if (!canEditName) {
+    return (
+      <h2 className="min-w-0 flex-1 truncate text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+        {column.name}
+      </h2>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={beginEdit}
+      aria-label={`Rename ${column.name} column`}
+      className={cn(
+        "group/rename flex min-w-0 flex-1 items-center gap-1.5 rounded-md text-left",
+        "-mx-1 px-1 py-0.5",
+        "transition-colors hover:bg-background/60",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background",
+      )}
+    >
+      <h2 className="min-w-0 flex-1 truncate text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+        {column.name}
+      </h2>
+      {/* Subtle pencil affordance — invisible by default so the chrome-free
+          look is preserved, fades in on hover/focus to telegraph editability
+          without competing with the column name. `aria-hidden` because the
+          button itself is already labelled. */}
+      <Pencil
+        className={cn(
+          "h-3 w-3 shrink-0 text-muted-foreground/70",
+          "opacity-0 transition-opacity",
+          "group-hover/rename:opacity-100 group-focus-visible/rename:opacity-100",
+        )}
+        aria-hidden="true"
+      />
+    </button>
   );
 }
 

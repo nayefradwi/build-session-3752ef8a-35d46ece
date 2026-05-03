@@ -5,6 +5,7 @@ import { z } from "zod";
 import { db } from "@/lib/db";
 import { columns, tasks, users } from "@/lib/db/schema";
 import { auth } from "@/lib/server/auth";
+import { recalculatePositions } from "@/lib/server/position";
 import { resolveProjectAccessByProjectId } from "@/lib/server/projects/access";
 import { computeMoveOrder } from "@/lib/server/tasks/move-order";
 
@@ -282,30 +283,48 @@ export async function PATCH(
         newPosition,
       });
 
-      // 4. Re-stamp 0..N-1. We skip rows whose position is already the
-      //    correct value (no-op) to keep the write set minimal — a typical
-      //    drop only shifts a contiguous window of cards by one.
-      for (const row of newOrder) {
+      // 4. Re-stamp positions following the canonical POSITION_STEP
+      //    (1000) spacing produced by `recalculatePositions`. The
+      //    `computeMoveOrder` helper hands back contiguous indices
+      //    (0..N-1) and we delegate the spacing transform to the
+      //    shared utility so every position-mutating endpoint produces
+      //    the same wire shape. Skipping no-op writes (the row's
+      //    position already matches the new value) keeps the write set
+      //    minimal — a typical drop only shifts a contiguous window of
+      //    cards by one. The moving row always writes because its
+      //    columnId may also be flipping (sentinel oldPosition=null).
+      const spacedOrder = recalculatePositions(
+        newOrder.map((row) => ({
+          id: row.id,
+          oldPosition: row.oldPosition,
+          isMoving: row.isMoving,
+          // `position` is required by the helper's `Positioned`
+          // constraint; the helper will overwrite it in the result, so
+          // any stub value works here.
+          position: 0,
+        })),
+      );
+      for (const row of spacedOrder) {
         if (row.isMoving) {
           await tx
             .update(tasks)
             .set({
               columnId: tgtCol.id,
-              position: row.newPosition,
+              position: row.position,
               updatedAt: sql`now()`,
             })
             .where(eq(tasks.id, moving.id));
-        } else if (row.oldPosition !== row.newPosition) {
+        } else if (row.oldPosition !== row.position) {
           await tx
             .update(tasks)
-            .set({ position: row.newPosition })
+            .set({ position: row.position })
             .where(eq(tasks.id, row.id));
         }
       }
 
-      // 5. Cross-column move: compact the source column so its remaining
-      //    tasks form a contiguous 0..M-1. Same-column moves don't need
-      //    this step (the splice above already handled both ends).
+      // 5. Cross-column move: compact the source column to the same
+      //    canonical 0, 1000, 2000... spacing. Same-column moves don't
+      //    need this step (the splice above already handled both ends).
       if (!sameColumn) {
         const sourceRemaining = await tx
           .select({ id: tasks.id, position: tasks.position })
@@ -313,13 +332,15 @@ export async function PATCH(
           .where(eq(tasks.columnId, srcCol.id))
           .orderBy(asc(tasks.position), asc(tasks.id));
 
+        const sourceSpaced = recalculatePositions(sourceRemaining);
         for (let i = 0; i < sourceRemaining.length; i++) {
-          const row = sourceRemaining[i];
-          if (row.position !== i) {
+          const original = sourceRemaining[i];
+          const spaced = sourceSpaced[i];
+          if (original.position !== spaced.position) {
             await tx
               .update(tasks)
-              .set({ position: i })
-              .where(eq(tasks.id, row.id));
+              .set({ position: spaced.position })
+              .where(eq(tasks.id, original.id));
           }
         }
       }

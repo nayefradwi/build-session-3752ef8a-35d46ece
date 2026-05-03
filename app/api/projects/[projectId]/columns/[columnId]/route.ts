@@ -19,7 +19,7 @@ type ColumnErrorCode =
   | "UNAUTHENTICATED"
   | "FORBIDDEN"
   | "NOT_FOUND"
-  | "MIN_COLUMNS"
+  | "LAST_COLUMN"
   | "COLUMN_HAS_TASKS"
   | "INTERNAL_ERROR";
 
@@ -35,6 +35,31 @@ const errorResponse = (
       : { error: message, code, details },
     { status },
   );
+
+// Structured-error responses for the two DELETE-column product invariants
+// (LAST_COLUMN, COLUMN_HAS_TASKS). The frontend renders contextual messaging
+// off these codes — e.g. "you can't delete this column because it has 3
+// tasks" — so the contract is `error: <CODE>, message: <human-readable>` plus
+// any extra fields the UI needs (`taskCount` so the toast can pluralize and
+// the disabled-button tooltip can show how many tasks block deletion).
+//
+// Note this shape differs from the generic `errorResponse` helper above:
+// `error` carries the *code* here (not the message), to match the explicit
+// task contract. The other error codes on this handler keep the legacy
+// shape for back-compat with sibling endpoints.
+const structuredColumnError = (
+  status: number,
+  body:
+    | {
+        error: "COLUMN_HAS_TASKS";
+        message: string;
+        taskCount: number;
+      }
+    | {
+        error: "LAST_COLUMN";
+        message: string;
+      },
+): NextResponse => NextResponse.json(body, { status });
 
 // projectId / columnId come from the dynamic segments; validate as UUIDs
 // before we hit Postgres so the uuid-cast in the WHERE clause never panics
@@ -273,20 +298,25 @@ export async function PUT(
  *     (which fall out of the visibility gate as 403 first).
  *
  * Product invariants (both surface as 422 — the request is well-formed but
- * the server state currently forbids the deletion):
- *   - **Minimum one column.** A project must always have at least one column
- *     so the kanban board has a place to render. Deleting the last remaining
- *     column would leave the board in a broken state, so the handler returns
- *     422 `MIN_COLUMNS` if the count under the lock is 1. We compute the
- *     count *under the project FOR UPDATE lock* so a peer DELETE that's
- *     already in flight serializes through us and the count we observe is
+ * the server state currently forbids the deletion). Both use a structured
+ * response body distinct from the generic `{ error, code }` shape so the
+ * frontend can render contextual messaging without re-parsing strings:
+ *   - **Last column.** A project must always have at least one column so the
+ *     kanban board has a place to render. Deleting the last remaining column
+ *     would leave the board in a broken state, so the handler returns 422
+ *     `{ error: "LAST_COLUMN", message: "Cannot delete the only remaining
+ *     column." }` if the count under the lock is 1. We compute the count
+ *     *under the project FOR UPDATE lock* so a peer DELETE that's already
+ *     in flight serializes through us and the count we observe is
  *     authoritative for the duration of this transaction.
  *   - **Column must be empty.** The column being deleted must have zero tasks.
  *     Cascading the task deletes implicitly would silently throw away user
- *     work; instead we surface 422 `COLUMN_HAS_TASKS` with the message
- *     "Move or delete tasks first" and let the client drive the cleanup. The
- *     count is taken under the column FOR UPDATE lock so a peer task-create
- *     can't race in between the count and the DELETE.
+ *     work; instead we surface 422 `{ error: "COLUMN_HAS_TASKS", message:
+ *     "Move or delete all tasks in this column before deleting it.",
+ *     taskCount: N }` and let the client drive the cleanup — the `taskCount`
+ *     lets the UI pluralize and surface "N tasks block deletion" without a
+ *     follow-up GET. The count is taken under the column FOR UPDATE lock so
+ *     a peer task-create can't race in between the count and the DELETE.
  *
  * Race safety:
  *   - We take a project FOR UPDATE lock first, then the column FOR UPDATE
@@ -434,14 +464,15 @@ export async function DELETE(
 
       const columnCount = columnCountRow?.count ?? 0;
       if (columnCount <= 1) {
-        return { kind: "min_columns" as const };
+        return { kind: "last_column" as const };
       }
 
       // Empty-column invariant. Count tasks under the column lock so a peer
       // task create / move can't slip a task in between the count and the
       // DELETE. tasks→columns is ON DELETE CASCADE, so without this guard
       // an admin could silently destroy user work; we surface 422 instead
-      // and let the client move/clean up first.
+      // and let the client move/clean up first. We pass `taskCount` back
+      // out so the structured error body can carry it to the UI.
       const [taskCountRow] = await tx
         .select({ count: sql<number>`count(*)::int` })
         .from(tasks)
@@ -449,7 +480,7 @@ export async function DELETE(
 
       const taskCount = taskCountRow?.count ?? 0;
       if (taskCount > 0) {
-        return { kind: "has_tasks" as const };
+        return { kind: "has_tasks" as const, taskCount };
       }
 
       // Safe to delete. Re-assert (id, projectId) in the WHERE clause as
@@ -471,19 +502,19 @@ export async function DELETE(
     if (result.kind === "not_found") {
       return errorResponse(404, "NOT_FOUND", "Column not found");
     }
-    if (result.kind === "min_columns") {
-      return errorResponse(
-        422,
-        "MIN_COLUMNS",
-        "Project must have at least one column",
-      );
+    if (result.kind === "last_column") {
+      return structuredColumnError(422, {
+        error: "LAST_COLUMN",
+        message: "Cannot delete the only remaining column.",
+      });
     }
     if (result.kind === "has_tasks") {
-      return errorResponse(
-        422,
-        "COLUMN_HAS_TASKS",
-        "Move or delete tasks first",
-      );
+      return structuredColumnError(422, {
+        error: "COLUMN_HAS_TASKS",
+        message:
+          "Move or delete all tasks in this column before deleting it.",
+        taskCount: result.taskCount,
+      });
     }
 
     // 204 No Content: the resource is gone and there's no representation to

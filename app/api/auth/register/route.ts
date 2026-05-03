@@ -5,6 +5,13 @@ import { z } from "zod";
 import { db } from "@/lib/db";
 import { invitations, tenants, users } from "@/lib/db/schema";
 import { hashPassword } from "@/lib/server/auth/password";
+import {
+  AUTH_RATE_LIMIT,
+  buildRateLimitHeaders,
+  checkLimit,
+  getClientIp,
+  type RateLimitResult,
+} from "@/lib/server/auth/rate-limit";
 import { registerInputSchema } from "@/lib/server/auth/register-schema";
 
 // Always treat as dynamic: this handler reads the request body and writes to
@@ -21,20 +28,46 @@ type RegisterErrorCode =
   | "INVITATION_ALREADY_ACCEPTED"
   | "INVITATION_EMAIL_MISMATCH"
   | "DOMAIN_TAKEN"
+  | "RATE_LIMITED"
   | "INTERNAL_ERROR";
 
+/**
+ * Build a JSON error response with rate-limit headers attached. We thread
+ * the current limiter result through every response (success and error) so
+ * legitimate clients can see how much budget they have left and back off
+ * before being blocked.
+ */
 const errorResponse = (
   status: number,
   code: RegisterErrorCode,
   message: string,
+  rateHeaders: Record<string, string>,
   details?: unknown,
 ): NextResponse =>
   NextResponse.json(
     details === undefined
       ? { error: message, code }
       : { error: message, code, details },
-    { status },
+    { status, headers: rateHeaders },
   );
+
+/**
+ * Build a 429 response from a blocked rate-limit result. Includes the
+ * `Retry-After` header (seconds) per RFC 7231 in addition to the
+ * `X-RateLimit-*` set so the client can pick whichever it prefers.
+ */
+function rateLimitedResponse(result: RateLimitResult): NextResponse {
+  const headers = buildRateLimitHeaders(result);
+  const retryAfterSec = headers["Retry-After"];
+  return NextResponse.json(
+    {
+      error: "Too many registration attempts. Please try again later.",
+      code: "RATE_LIMITED" satisfies RegisterErrorCode,
+      retryAfterSeconds: retryAfterSec ? Number(retryAfterSec) : undefined,
+    },
+    { status: 429, headers },
+  );
+}
 
 /**
  * Pull the lowercase domain part of an email. The zod schema has already
@@ -57,6 +90,18 @@ function escapeLikePattern(value: string): string {
 }
 
 export async function POST(request: Request): Promise<NextResponse> {
+  // 0. Brute-force / abuse guard. We cap total registration attempts from a
+  //    single IP at 10 every 15 minutes (`AUTH_RATE_LIMIT`). The check runs
+  //    BEFORE JSON parsing or any DB work so a flood of garbage bodies
+  //    can't burn server resources. Every response below carries the
+  //    `X-RateLimit-*` headers so well-behaved clients can self-throttle.
+  const ip = getClientIp(request);
+  const rateResult = checkLimit(`register:${ip}`, AUTH_RATE_LIMIT);
+  const rateHeaders = buildRateLimitHeaders(rateResult);
+  if (!rateResult.ok) {
+    return rateLimitedResponse(rateResult);
+  }
+
   // 1. Parse JSON body. Malformed JSON should be a 400, not a 500.
   let rawBody: unknown;
   try {
@@ -66,6 +111,7 @@ export async function POST(request: Request): Promise<NextResponse> {
       400,
       "INVALID_JSON",
       "Request body must be valid JSON",
+      rateHeaders,
     );
   }
 
@@ -78,6 +124,7 @@ export async function POST(request: Request): Promise<NextResponse> {
       400,
       "INVALID_INPUT",
       "Validation failed",
+      rateHeaders,
       z.treeifyError(parsed.error),
     );
   }
@@ -97,6 +144,7 @@ export async function POST(request: Request): Promise<NextResponse> {
       409,
       "EMAIL_TAKEN",
       "An account with this email already exists",
+      rateHeaders,
     );
   }
 
@@ -124,6 +172,7 @@ export async function POST(request: Request): Promise<NextResponse> {
         400,
         "INVITATION_INVALID",
         "This invitation link is not recognized",
+        rateHeaders,
       );
     }
 
@@ -132,6 +181,7 @@ export async function POST(request: Request): Promise<NextResponse> {
         409,
         "INVITATION_ALREADY_ACCEPTED",
         "This invitation has already been redeemed",
+        rateHeaders,
       );
     }
 
@@ -140,6 +190,7 @@ export async function POST(request: Request): Promise<NextResponse> {
         410,
         "INVITATION_EXPIRED",
         "This invitation has expired",
+        rateHeaders,
       );
     }
 
@@ -152,6 +203,7 @@ export async function POST(request: Request): Promise<NextResponse> {
         400,
         "INVITATION_EMAIL_MISMATCH",
         "This invitation was issued to a different email address",
+        rateHeaders,
       );
     }
 
@@ -231,7 +283,7 @@ export async function POST(request: Request): Promise<NextResponse> {
           user: result.user,
           tenant: result.tenant,
         },
-        { status: 201 },
+        { status: 201, headers: rateHeaders },
       );
     } catch (err: unknown) {
       if (err instanceof InvitationRedeemError) {
@@ -241,24 +293,28 @@ export async function POST(request: Request): Promise<NextResponse> {
               400,
               "INVITATION_INVALID",
               "This invitation link is not recognized",
+              rateHeaders,
             );
           case "INVITATION_ALREADY_ACCEPTED":
             return errorResponse(
               409,
               "INVITATION_ALREADY_ACCEPTED",
               "This invitation has already been redeemed",
+              rateHeaders,
             );
           case "INVITATION_EXPIRED":
             return errorResponse(
               410,
               "INVITATION_EXPIRED",
               "This invitation has expired",
+              rateHeaders,
             );
           case "INVITATION_EMAIL_MISMATCH":
             return errorResponse(
               400,
               "INVITATION_EMAIL_MISMATCH",
               "This invitation was issued to a different email address",
+              rateHeaders,
             );
         }
       }
@@ -274,6 +330,7 @@ export async function POST(request: Request): Promise<NextResponse> {
           409,
           "EMAIL_TAKEN",
           "An account with this email already exists",
+          rateHeaders,
         );
       }
 
@@ -282,6 +339,7 @@ export async function POST(request: Request): Promise<NextResponse> {
         500,
         "INTERNAL_ERROR",
         "Unable to create account at this time",
+        rateHeaders,
       );
     }
   }
@@ -299,6 +357,7 @@ export async function POST(request: Request): Promise<NextResponse> {
       400,
       "INVALID_INPUT",
       "organizationName is required when no invitation token is provided",
+      rateHeaders,
     );
   }
 
@@ -315,6 +374,7 @@ export async function POST(request: Request): Promise<NextResponse> {
         409,
         "DOMAIN_TAKEN",
         "An organization for this email domain already exists. Ask an admin to invite you instead.",
+        rateHeaders,
       );
     }
   }
@@ -361,7 +421,7 @@ export async function POST(request: Request): Promise<NextResponse> {
         user: result.user,
         tenant: result.tenant,
       },
-      { status: 201 },
+      { status: 201, headers: rateHeaders },
     );
   } catch (err: unknown) {
     // Race-condition path: another request created a user with this email
@@ -376,6 +436,7 @@ export async function POST(request: Request): Promise<NextResponse> {
         409,
         "EMAIL_TAKEN",
         "An account with this email already exists",
+        rateHeaders,
       );
     }
     console.error("[POST /api/auth/register] unexpected error", err);
@@ -383,6 +444,7 @@ export async function POST(request: Request): Promise<NextResponse> {
       500,
       "INTERNAL_ERROR",
       "Unable to create account at this time",
+      rateHeaders,
     );
   }
 }
