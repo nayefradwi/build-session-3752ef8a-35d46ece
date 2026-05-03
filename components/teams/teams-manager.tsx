@@ -280,7 +280,7 @@ function TeamCard({ team }: TeamCardProps) {
 
   return (
     <Link
-      href={`/dashboard/teams/${team.id}`}
+      href={`/teams/${team.id}/members`}
       aria-label={`Open ${team.name} (${memberLabel}${team.isMember ? ", you are a member" : ""})`}
       className="group block h-full rounded-lg outline-none ring-offset-2 ring-offset-background transition-shadow focus-visible:ring-2 focus-visible:ring-ring"
     >
