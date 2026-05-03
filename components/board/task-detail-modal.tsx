@@ -30,6 +30,10 @@ import {
   AssigneeSelect,
   type AssigneeMember,
 } from "@/components/board/assignee-select";
+import {
+  AttachmentUploader,
+  type UploadedAttachment,
+} from "@/components/board/attachment-uploader";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button, buttonVariants } from "@/components/ui/button";
 import {
@@ -367,6 +371,27 @@ export function TaskDetailModal({
     };
   }, [open, taskId, retryCounter]);
 
+  // Splice a freshly-uploaded attachment into the modal's local task state
+  // so the new row renders without a full task refetch. The attachment
+  // upload endpoint is fire-and-forget at the parent level (the kanban
+  // board doesn't track attachments per card), so we only need to update
+  // local state — no parent callback is required here.
+  const applyAttachmentAdded = useCallback(
+    (attachment: UploadedAttachment) => {
+      setTask((prev) =>
+        prev
+          ? {
+              ...prev,
+              attachments: prev.attachments.some((a) => a.id === attachment.id)
+                ? prev.attachments
+                : [...prev.attachments, attachment],
+            }
+          : prev,
+      );
+    },
+    [],
+  );
+
   // Apply a successful save: update the modal's local task state in-place
   // (so the view mode renders the new fields without a re-fetch) and
   // forward a board-shaped slice to the parent so it can sync the touched
@@ -504,6 +529,7 @@ export function TaskDetailModal({
               onEdit={() => setEditing(true)}
               onClose={() => onOpenChange(false)}
               onRequestDelete={() => setConfirmDeleteOpen(true)}
+              onAttachmentAdded={applyAttachmentAdded}
             />
           )
         ) : null}
@@ -583,12 +609,14 @@ function TaskDetailBody({
   onEdit,
   onClose,
   onRequestDelete,
+  onAttachmentAdded,
 }: {
   task: TaskDetail;
   canEdit: boolean;
   onEdit: () => void;
   onClose: () => void;
   onRequestDelete: () => void;
+  onAttachmentAdded: (attachment: UploadedAttachment) => void;
 }) {
   return (
     <>
@@ -664,6 +692,18 @@ function TaskDetailBody({
               ))}
             </ul>
           )}
+          {/* Upload affordance — gated on team membership (the POST
+              endpoint 403s non-members, so the uploader returns null when
+              `disabled` is set). The uploader handles its own client-side
+              size / type / count validation and surfaces toasts for limit
+              violations, then calls back here on success to splice the
+              fresh attachment into the local task state. */}
+          <AttachmentUploader
+            taskId={task.id}
+            count={task.attachments.length}
+            disabled={!canEdit}
+            onUploaded={onAttachmentAdded}
+          />
         </section>
 
         {/* ---------- Timestamps ---------- */}
