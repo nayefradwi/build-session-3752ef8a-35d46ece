@@ -29,6 +29,11 @@ import {
 import { toast } from "sonner";
 
 import { ApiError, apiClient } from "@/lib/client/api-client";
+import {
+  applyOptimisticMove,
+  isSameColumnNoop,
+  resolveSameColumnDropIndex,
+} from "@/lib/client/board-state";
 import { cn } from "@/lib/client/utils";
 import { Button } from "@/components/ui/button";
 import {
@@ -44,78 +49,6 @@ import {
 } from "@/components/board/add-task-dialog";
 import { TaskDetailModal } from "@/components/board/task-detail-modal";
 import type { BoardColumnData, BoardTask } from "@/components/board/types";
-
-/* -------------------------------------------------------------------------- */
-/*                          Optimistic move helper                            */
-/* -------------------------------------------------------------------------- */
-
-/**
- * Pure splice helper: produce a new `columns` array with the given task
- * relocated to `targetColumnId` at index `newPosition`. Mirrors the server
- * algorithm in PATCH /api/tasks/[taskId]/move:
- *
- *   1. Pull the moving task out of its source lane.
- *   2. Insert it at the clamped index in the target lane (clamp matches
- *      the server: [0, length] for cross-column, [0, length] same-column
- *      after removal).
- *   3. Re-stamp positions to a contiguous 0..N-1 range in both lanes so
- *      sibling cards reflect their post-move slot. The server does the
- *      same compaction; computing it here keeps the optimistic UI in
- *      sync with whatever the server will respond.
- *
- * Returns `null` if the task can't be located in the snapshot (defensive —
- * a stale callsite shouldn't crash, just no-op).
- */
-function applyOptimisticMove(
-  columns: BoardColumnData[],
-  taskId: string,
-  targetColumnId: string,
-  newPosition: number,
-): BoardColumnData[] | null {
-  let movingTask: BoardTask | null = null;
-
-  const stripped = columns.map((col) => {
-    const idx = col.tasks.findIndex((t) => t.id === taskId);
-    if (idx === -1) return col;
-    movingTask = col.tasks[idx];
-    return {
-      ...col,
-      tasks: col.tasks.filter((t) => t.id !== taskId),
-    };
-  });
-
-  if (!movingTask) return null;
-  const moving: BoardTask = movingTask;
-
-  const next = stripped.map((col) => {
-    if (col.id !== targetColumnId) {
-      // Source lane (or any other untouched lane): re-stamp positions so
-      // the gap left behind closes contiguously, matching the server's
-      // post-move compaction.
-      const tasks = col.tasks.map((t, i) =>
-        t.position === i ? t : { ...t, position: i },
-      );
-      return tasks === col.tasks ? col : { ...col, tasks };
-    }
-    const insertIdx = Math.min(
-      Math.max(Math.floor(newPosition), 0),
-      col.tasks.length,
-    );
-    const inserted: BoardTask = {
-      ...moving,
-      columnId: targetColumnId,
-      position: insertIdx,
-    };
-    const merged = [
-      ...col.tasks.slice(0, insertIdx),
-      inserted,
-      ...col.tasks.slice(insertIdx),
-    ].map((t, i) => (t.position === i ? t : { ...t, position: i }));
-    return { ...col, tasks: merged };
-  });
-
-  return next;
-}
 
 /* -------------------------------------------------------------------------- */
 /*                                API contracts                               */
@@ -863,8 +796,15 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
         // exactly at `overIndex` after the splice (within the same lane),
         // and at `overIndex` (insert-before) when crossing lanes. So we
         // forward the snapshot index directly.
-        newPosition = targetCol.tasks.findIndex(
-          (t) => t.id === overData.task!.id,
+        //
+        // For same-column reorder this is the canonical path: the moving
+        // card is still in the lane in the snapshot, so `findIndex(over)`
+        // resolves to its post-shift slot for free. For cross-column the
+        // moving card is absent from the target lane, so the same call
+        // resolves to "insert before the over-task" instead.
+        newPosition = resolveSameColumnDropIndex(
+          targetCol.tasks,
+          overData.task.id,
         );
         if (newPosition < 0) {
           rollbackSnapshotRef.current = null;
@@ -918,10 +858,13 @@ export function KanbanBoard({ teamId }: KanbanBoardProps) {
 
       // No-op drop: source column + position unchanged. Skip the round
       // trip entirely so dragging a card and dropping it back where it
-      // started doesn't churn the database.
-      const sameColumn = sourceColumn.id === targetColumnId;
-      const oldIndex = sourceColumn.tasks.findIndex((t) => t.id === activeId);
-      if (sameColumn && oldIndex === newPosition) {
+      // started doesn't churn the database. Covers two same-column cases:
+      //   1. The user pressed, exceeded the activation distance, then
+      //      released over the source slot (over.id === active.id).
+      //   2. The user dragged across an adjacent sibling and back before
+      //      release — the optimistic splice would still produce the
+      //      original ordering.
+      if (isSameColumnNoop(sourceColumn, targetColumnId, activeId, newPosition)) {
         rollbackSnapshotRef.current = null;
         return;
       }

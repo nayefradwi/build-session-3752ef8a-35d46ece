@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --conditions=react-server --test lib/server/tasks/__tests__/move-order.test.ts lib/server/uploads/__tests__/validation.test.ts lib/server/__tests__/position.test.ts"
+    "test": "tsx --conditions=react-server --test lib/server/tasks/__tests__/move-order.test.ts lib/server/uploads/__tests__/validation.test.ts lib/server/__tests__/position.test.ts lib/client/__tests__/board-state.test.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
