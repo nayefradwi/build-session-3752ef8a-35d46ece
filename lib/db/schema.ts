@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
+  index,
   integer,
   pgEnum,
   pgTable,
@@ -31,6 +32,17 @@ export const userRoleEnum = pgEnum("user_role", ["admin", "member"]);
 export const invitationStatusEnum = pgEnum("invitation_status", [
   "pending",
   "accepted",
+]);
+
+// team-scoped role applied to team_memberships.role. Distinct from
+// userRoleEnum so user-level and team-level roles can evolve independently.
+export const teamRoleEnum = pgEnum("team_role", ["admin", "member"]);
+
+// project visibility — "public" projects are visible to all members of the
+// owning tenant, "private" projects are restricted to team members.
+export const projectVisibilityEnum = pgEnum("project_visibility", [
+  "public",
+  "private",
 ]);
 
 export const tenants = pgTable("tenants", {
@@ -143,6 +155,102 @@ export const invitations = pgTable(
   ],
 );
 
+// Teams: tenant-scoped collaboration units. A team belongs to a tenant and
+// owns zero-or-more projects; users join teams via team_memberships.
+export const teams = pgTable(
+  "teams",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    name: text("name").notNull(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    // Tenant-scoped listings ("show me my tenant's teams") are the dominant
+    // read pattern; index the FK so the planner can range-scan by tenant.
+    index("teams_tenant_id_idx").on(table.tenantId),
+  ],
+);
+
+// Team memberships: many-to-many between users and teams with a per-team
+// role. The composite PK (userId, teamId) enforces "a user joins a team at
+// most once" at the database layer.
+export const teamMemberships = pgTable(
+  "team_memberships",
+  {
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    teamId: uuid("team_id")
+      .notNull()
+      .references(() => teams.id, { onDelete: "cascade" }),
+    role: teamRoleEnum("role").notNull().default("member"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.userId, table.teamId],
+      name: "team_memberships_user_id_team_id_pk",
+    }),
+    // The composite PK leads with userId, so "list a team's members" needs
+    // its own index on teamId for efficient lookups.
+    index("team_memberships_team_id_idx").on(table.teamId),
+  ],
+);
+
+// Projects belong to a single team. Visibility gates whether non-team
+// members of the same tenant can view the project.
+export const projects = pgTable(
+  "projects",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    teamId: uuid("team_id")
+      .notNull()
+      .references(() => teams.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    visibility: projectVisibilityEnum("visibility")
+      .notNull()
+      .default("private"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    // "List a team's projects" is the hot path — index the FK.
+    index("projects_team_id_idx").on(table.teamId),
+  ],
+);
+
+// Columns are ordered lanes within a project (kanban-style). `position` is
+// an integer order key; the (projectId, position) pair is unique so two
+// columns can't occupy the same slot.
+export const columns = pgTable(
+  "columns",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    position: integer("position").notNull(),
+  },
+  (table) => [
+    // Render-order queries always filter by projectId and sort by position.
+    // A unique composite index serves both the ordering scan and the
+    // "no two columns share a slot" invariant in one structure.
+    uniqueIndex("columns_project_id_position_unique").on(
+      table.projectId,
+      table.position,
+    ),
+  ],
+);
+
 export type Tenant = typeof tenants.$inferSelect;
 export type NewTenant = typeof tenants.$inferInsert;
 export type User = typeof users.$inferSelect;
@@ -155,6 +263,14 @@ export type VerificationToken = typeof verificationTokens.$inferSelect;
 export type NewVerificationToken = typeof verificationTokens.$inferInsert;
 export type Invitation = typeof invitations.$inferSelect;
 export type NewInvitation = typeof invitations.$inferInsert;
+export type Team = typeof teams.$inferSelect;
+export type NewTeam = typeof teams.$inferInsert;
+export type TeamMembership = typeof teamMemberships.$inferSelect;
+export type NewTeamMembership = typeof teamMemberships.$inferInsert;
+export type Project = typeof projects.$inferSelect;
+export type NewProject = typeof projects.$inferInsert;
+export type Column = typeof columns.$inferSelect;
+export type NewColumn = typeof columns.$inferInsert;
 
 // Re-export `sql` so callers downstream can use raw expressions without
 // re-importing drizzle-orm directly from the schema module.

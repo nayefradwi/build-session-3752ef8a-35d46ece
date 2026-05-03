@@ -15,6 +15,13 @@
       "when": 1777801057355,
       "tag": "0001_bored_forgotten_one",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1777801533816,
+      "tag": "0002_woozy_leo",
+      "breakpoints": true
     }
   ]
 }
