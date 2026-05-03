@@ -384,6 +384,16 @@ export function TaskDetailModal({
   // dismissed (Cancel disabled, outside-click ignored) and the parent
   // Dialog also blocks dismissal so the user can't navigate away mid-call.
   const [deleting, setDeleting] = useState(false);
+  // Attachment-delete confirmation. We hold the *target* attachment (rather
+  // than just an id + open flag) so the AlertDialog can show its filename in
+  // the confirm prompt and we can cleanly forget which row we were operating
+  // on after a successful delete or cancel.
+  const [attachmentPendingDelete, setAttachmentPendingDelete] =
+    useState<TaskDetailAttachment | null>(null);
+  // Per-attachment delete in-flight indicator. Mirrors the task-delete
+  // `deleting` state — blocks AlertDialog dismissal while the DELETE round
+  // trip is open so the user always sees the success / failure toast.
+  const [deletingAttachment, setDeletingAttachment] = useState(false);
 
   // Reset transient state every time the dialog closes so a re-open on the
   // same id doesn't briefly flash the previous task's content (or stale
@@ -399,6 +409,8 @@ export function TaskDetailModal({
       setSaving(false);
       setConfirmDeleteOpen(false);
       setDeleting(false);
+      setAttachmentPendingDelete(null);
+      setDeletingAttachment(false);
     }
   }, [open]);
 
@@ -472,6 +484,72 @@ export function TaskDetailModal({
     },
     [],
   );
+
+  // Remove a deleted attachment from the modal's local task state. Mirrors
+  // {@link applyAttachmentAdded}: attachments are only tracked locally to
+  // this modal, so dropping the row from `task.attachments` is sufficient
+  // to update both the rendered list and the count badge in the header.
+  const applyAttachmentRemoved = useCallback((attachmentId: string) => {
+    setTask((prev) =>
+      prev
+        ? {
+            ...prev,
+            attachments: prev.attachments.filter((a) => a.id !== attachmentId),
+          }
+        : prev,
+    );
+  }, []);
+
+  // Confirmed attachment-delete path. Fires DELETE
+  // /api/attachments/[attachmentId], surfaces a success toast, splices the
+  // row out of the modal's local task state, and dismisses the
+  // AlertDialog. On failure we keep the AlertDialog open so the user can
+  // retry without losing context — the toast describes what went wrong.
+  //
+  // 404 is treated as a successful no-op so a row that has already been
+  // deleted (concurrent admin action, or a stale modal) doesn't strand the
+  // user on a "Couldn't delete" toast for an attachment that's already
+  // gone. The wire shape of DELETE is 204 No Content — there's no body to
+  // parse on success.
+  const handleConfirmAttachmentDelete = useCallback(async () => {
+    if (!attachmentPendingDelete || deletingAttachment) return;
+    const target = attachmentPendingDelete;
+    setDeletingAttachment(true);
+    try {
+      await apiClient.delete(`/api/attachments/${target.id}`, {
+        silent: true,
+        skipAuthRedirect: true,
+      });
+      toast.success("Attachment deleted", {
+        description: `“${target.filename}” has been removed.`,
+      });
+      applyAttachmentRemoved(target.id);
+      setAttachmentPendingDelete(null);
+    } catch (err) {
+      if (err instanceof ApiError) {
+        if (err.status === 404) {
+          // Already gone — surface as a success so the row drops out of
+          // the list cleanly rather than leaving the user on a confusing
+          // error toast for a deletion that already happened.
+          toast.success("Attachment deleted", {
+            description: "This attachment was already removed.",
+          });
+          applyAttachmentRemoved(target.id);
+          setAttachmentPendingDelete(null);
+        } else {
+          toast.error("Couldn't delete attachment", {
+            description: err.message,
+          });
+        }
+      } else {
+        toast.error("Couldn't delete attachment", {
+          description: "Something went wrong. Please try again.",
+        });
+      }
+    } finally {
+      setDeletingAttachment(false);
+    }
+  }, [applyAttachmentRemoved, attachmentPendingDelete, deletingAttachment]);
 
   // Apply a successful save: update the modal's local task state in-place
   // (so the view mode renders the new fields without a re-fetch) and
@@ -563,8 +641,10 @@ export function TaskDetailModal({
       open={open}
       onOpenChange={(next) => {
         // Block dismiss while a save or delete is in flight so we don't
-        // strand the user without confirmation of the result.
-        if ((saving || deleting) && !next) return;
+        // strand the user without confirmation of the result. Both task-
+        // delete and attachment-delete in-flights count — losing the modal
+        // mid-call would orphan the toast feedback.
+        if ((saving || deleting || deletingAttachment) && !next) return;
         onOpenChange(next);
       }}
     >
@@ -611,6 +691,9 @@ export function TaskDetailModal({
               onClose={() => onOpenChange(false)}
               onRequestDelete={() => setConfirmDeleteOpen(true)}
               onAttachmentAdded={applyAttachmentAdded}
+              onRequestDeleteAttachment={(attachment) =>
+                setAttachmentPendingDelete(attachment)
+              }
             />
           )
         ) : null}
@@ -676,6 +759,64 @@ export function TaskDetailModal({
           </AlertDialogContent>
         </AlertDialog>
       ) : null}
+      {/* Attachment-delete AlertDialog. Sibling of the parent Dialog (same
+          rationale as the task-delete AlertDialog above) so its overlay
+          stacks cleanly and Radix's focus trap doesn't fight the parent.
+          Driven by `attachmentPendingDelete`: when non-null, the dialog is
+          open and references the targeted attachment. We hold the *target*
+          object (not just an id) so the prompt can show the filename. */}
+      {attachmentPendingDelete ? (
+        <AlertDialog
+          open={attachmentPendingDelete !== null}
+          onOpenChange={(next) => {
+            // Block dismissal mid-call so the user always sees the toast.
+            if (deletingAttachment && !next) return;
+            if (!next) setAttachmentPendingDelete(null);
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Delete this attachment?</AlertDialogTitle>
+              <AlertDialogDescription>
+                “{attachmentPendingDelete.filename}” will be permanently
+                removed. This can&apos;t be undone.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={deletingAttachment}>
+                Cancel
+              </AlertDialogCancel>
+              <AlertDialogAction
+                className={cn(buttonVariants({ variant: "destructive" }))}
+                disabled={deletingAttachment}
+                onClick={(event) => {
+                  // Same trick as the task-delete confirm: keep the dialog
+                  // open through the network round-trip so we can surface
+                  // a retry path on failure rather than dismissing on
+                  // click and stranding the user with no feedback surface.
+                  event.preventDefault();
+                  void handleConfirmAttachmentDelete();
+                }}
+              >
+                {deletingAttachment ? (
+                  <>
+                    <Loader2
+                      className="h-4 w-4 animate-spin"
+                      aria-hidden="true"
+                    />
+                    Deleting…
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="h-4 w-4" aria-hidden="true" />
+                    Delete
+                  </>
+                )}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      ) : null}
     </Dialog>
   );
 }
@@ -691,6 +832,7 @@ function TaskDetailBody({
   onClose,
   onRequestDelete,
   onAttachmentAdded,
+  onRequestDeleteAttachment,
 }: {
   task: TaskDetail;
   canEdit: boolean;
@@ -698,6 +840,13 @@ function TaskDetailBody({
   onClose: () => void;
   onRequestDelete: () => void;
   onAttachmentAdded: (attachment: UploadedAttachment) => void;
+  /**
+   * Opens the per-attachment delete-confirmation AlertDialog mounted at the
+   * modal level. Carries the full attachment so the prompt can show the
+   * filename. Gated to team members only via the trash affordance in
+   * {@link AttachmentRow}; the server enforces the same policy on DELETE.
+   */
+  onRequestDeleteAttachment: (attachment: TaskDetailAttachment) => void;
 }) {
   return (
     <>
@@ -768,7 +917,11 @@ function TaskDetailBody({
             <ul className="divide-y divide-border rounded-md border" role="list">
               {task.attachments.map((attachment) => (
                 <li key={attachment.id}>
-                  <AttachmentRow attachment={attachment} />
+                  <AttachmentRow
+                    attachment={attachment}
+                    canDelete={canEdit}
+                    onRequestDelete={() => onRequestDeleteAttachment(attachment)}
+                  />
                 </li>
               ))}
             </ul>
@@ -1320,42 +1473,94 @@ function AssigneeRow({ assignee }: { assignee: TaskDetailAssignee }) {
  *     reinforces that activating the row downloads bytes rather than opening
  *     a preview surface.
  */
-function AttachmentRow({ attachment }: { attachment: TaskDetailAttachment }) {
+function AttachmentRow({
+  attachment,
+  canDelete,
+  onRequestDelete,
+}: {
+  attachment: TaskDetailAttachment;
+  /**
+   * Whether the caller is a team member. Gates the trailing trash icon —
+   * the DELETE endpoint enforces the same policy server-side, so showing
+   * the affordance to non-members would just produce a guaranteed-403.
+   */
+  canDelete: boolean;
+  /**
+   * Open the modal-level delete-confirmation AlertDialog for this row.
+   * Wired up by {@link TaskDetailBody}'s `onRequestDeleteAttachment` prop.
+   */
+  onRequestDelete: () => void;
+}) {
   const TypeIcon = iconForMimeType(attachment.mimeType);
+  // The row is rendered as a flex container with the download anchor and
+  // the (optional) delete button as siblings. Buttons inside `<a>` are
+  // invalid HTML and cause real-world clicks-on-the-button to also trigger
+  // the anchor navigation — so the structure is two adjacent interactive
+  // controls instead. The whole row gets a single hover background via the
+  // `group` so visually it still reads as one unit.
   return (
-    <a
-      href={`/api/attachments/${attachment.id}`}
-      // The server's Content-Disposition is the source of truth for the
-      // saved filename; `download={filename}` is the client-side fallback
-      // for browsers that don't fully parse the RFC 5987 extended form.
-      download={attachment.filename}
-      // Same-origin link, so `noopener noreferrer` is defensive overkill —
-      // but cheap, and consistent with the rest of the modal's outbound
-      // anchor styling.
-      rel="noopener noreferrer"
+    <div
       className={cn(
-        "flex items-center gap-3 px-3 py-2 text-sm",
-        "transition-colors hover:bg-muted focus-visible:outline-none focus-visible:bg-muted",
+        "group flex items-stretch text-sm",
+        "transition-colors hover:bg-muted focus-within:bg-muted",
       )}
-      aria-label={`Download ${attachment.filename} (${formatFileSize(attachment.size)})`}
     >
-      <TypeIcon
-        className="h-4 w-4 shrink-0 text-muted-foreground"
-        aria-hidden="true"
-      />
-      <div className="min-w-0 flex-1">
-        <p className="truncate font-medium">{attachment.filename}</p>
-        <p className="truncate text-xs text-muted-foreground">
-          <span className="font-mono">{attachment.mimeType}</span>
-          {" · "}
-          {formatFileSize(attachment.size)}
-        </p>
-      </div>
-      <Download
-        className="h-4 w-4 shrink-0 text-muted-foreground"
-        aria-hidden="true"
-      />
-    </a>
+      <a
+        href={`/api/attachments/${attachment.id}`}
+        // The server's Content-Disposition is the source of truth for the
+        // saved filename; `download={filename}` is the client-side fallback
+        // for browsers that don't fully parse the RFC 5987 extended form.
+        download={attachment.filename}
+        // Same-origin link, so `noopener noreferrer` is defensive overkill —
+        // but cheap, and consistent with the rest of the modal's outbound
+        // anchor styling.
+        rel="noopener noreferrer"
+        className={cn(
+          "flex min-w-0 flex-1 items-center gap-3 px-3 py-2",
+          "focus-visible:outline-none",
+        )}
+        aria-label={`Download ${attachment.filename} (${formatFileSize(attachment.size)})`}
+      >
+        <TypeIcon
+          className="h-4 w-4 shrink-0 text-muted-foreground"
+          aria-hidden="true"
+        />
+        <div className="min-w-0 flex-1">
+          <p className="truncate font-medium">{attachment.filename}</p>
+          <p className="truncate text-xs text-muted-foreground">
+            <span className="font-mono">{attachment.mimeType}</span>
+            {" · "}
+            {formatFileSize(attachment.size)}
+          </p>
+        </div>
+        <Download
+          className="h-4 w-4 shrink-0 text-muted-foreground"
+          aria-hidden="true"
+        />
+      </a>
+      {canDelete ? (
+        // Sibling delete affordance. We deliberately render it as a real
+        // `<button>` (not the shadcn `<Button>` variant) because we want a
+        // tight, icon-only target that hugs the right edge of the row
+        // without throwing the row's vertical rhythm off. The destructive
+        // hover styling reinforces the irreversible nature of the action.
+        <button
+          type="button"
+          onClick={onRequestDelete}
+          aria-label={`Delete ${attachment.filename}`}
+          title="Delete attachment"
+          className={cn(
+            "flex shrink-0 items-center justify-center px-3",
+            "text-muted-foreground transition-colors",
+            "hover:text-destructive focus-visible:text-destructive",
+            "focus-visible:outline-none focus-visible:ring-2",
+            "focus-visible:ring-ring focus-visible:ring-offset-2",
+          )}
+        >
+          <Trash2 className="h-4 w-4" aria-hidden="true" />
+        </button>
+      ) : null}
+    </div>
   );
 }
 
