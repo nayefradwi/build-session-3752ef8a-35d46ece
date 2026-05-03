@@ -449,3 +449,153 @@ export async function PUT(
     );
   }
 }
+
+/**
+ * DELETE /api/tasks/[taskId]
+ *
+ * Permanently delete a task. On success returns 204 No Content with an empty
+ * body — the row is gone, there's nothing meaningful to echo back, and the
+ * REST contract for "no representation to return" is the empty 204.
+ *
+ * Authorization (mirrors PUT):
+ *   - Caller must be authenticated (401 otherwise).
+ *   - The task's owning project must live in the caller's tenant. Cross-tenant
+ *     or non-existent task ids collapse to 404 to avoid leaking existence.
+ *   - Caller must be a *team member* of the owning team. Public-project
+ *     visibility lets non-members read tasks, but every write path (create,
+ *     edit, delete) requires team membership; non-members get 403.
+ *
+ * Cascade semantics:
+ *   - Associated attachments (DB rows + storage objects) are required to be
+ *     cleaned up alongside the task. The attachment data model has NOT shipped
+ *     yet (see GET above — `attachments` is a hard-coded empty list on the
+ *     wire), so there is nothing to delete today. The transaction below is
+ *     structured to make the future addition trivial: once `lib/db/schema.ts`
+ *     gains an `attachments` table, the cleanup is one extra `tx.delete(...)`
+ *     plus a storage-driver call inside the same atomic block.
+ *   - Tasks themselves have no children that need manual cleanup at the DB
+ *     layer today; the schema's cascade rules (FK from columns/users) only
+ *     fire on parent deletes, not on a task delete, so a plain DELETE row is
+ *     sufficient for the current model.
+ *
+ * Atomicity:
+ *   - The whole operation runs inside `db.transaction(...)` so even though the
+ *     attachment cleanup is a no-op today, callers can rely on the contract
+ *     "either everything is gone, or nothing changed" once attachments ship.
+ *   - We re-read the task FOR UPDATE inside the transaction so a concurrent
+ *     DELETE of the same row collapses to a single winner; the loser sees
+ *     "row not found" under the lock and 404s cleanly instead of double-
+ *     deleting and then trying to remove already-removed storage objects.
+ */
+export async function DELETE(
+  _request: Request,
+  context: { params: Promise<{ taskId: string }> },
+): Promise<NextResponse> {
+  const session = await auth();
+  if (!session?.user?.id || !session.user.tenantId) {
+    return errorResponse(401, "UNAUTHENTICATED", "Sign in to continue");
+  }
+
+  const { taskId: rawTaskId } = await context.params;
+  const taskIdParse = taskIdParamSchema.safeParse(rawTaskId);
+  if (!taskIdParse.success) {
+    return errorResponse(400, "INVALID_INPUT", "Invalid task id");
+  }
+
+  try {
+    // 1. Resolve the task's owning project OUTSIDE the transaction so we can
+    //    reuse the shared access helper (which itself queries the DB). The
+    //    helper enforces the tenant + visibility gate; cross-tenant rows
+    //    collapse to 404 in the same shape as every other task endpoint.
+    const [taskRow] = await db
+      .select({
+        id: tasks.id,
+        projectId: columns.projectId,
+      })
+      .from(tasks)
+      .innerJoin(columns, eq(columns.id, tasks.columnId))
+      .where(eq(tasks.id, taskIdParse.data))
+      .limit(1);
+
+    if (!taskRow) {
+      return errorResponse(404, "NOT_FOUND", "Task not found");
+    }
+
+    const access = await resolveProjectAccessByProjectId({
+      projectId: taskRow.projectId,
+      tenantId: session.user.tenantId,
+      userId: session.user.id,
+    });
+
+    if (!access.ok) {
+      if (access.reason === "forbidden") {
+        return errorResponse(
+          403,
+          "FORBIDDEN",
+          "You do not have access to this task",
+        );
+      }
+      return errorResponse(404, "NOT_FOUND", "Task not found");
+    }
+
+    // Membership gate. Public projects let non-members read but writes require
+    // team membership.
+    if (!access.isMember) {
+      return errorResponse(
+        403,
+        "FORBIDDEN",
+        "Only team members can delete tasks",
+      );
+    }
+
+    // 2. Atomic delete. The attachment cleanup is a no-op today (no schema /
+    //    storage driver yet) but the transaction boundary is the right place
+    //    for it to land later: row-deletes for `attachments` rows go before
+    //    the storage-driver calls, and both happen before the task DELETE so
+    //    a failure at any step rolls everything back.
+    const result = await db.transaction(async (tx) => {
+      // Re-read the task under a row lock so a concurrent DELETE serializes
+      // through us. If the row is gone by the time we acquire the lock the
+      // peer transaction won the race and we 404.
+      const [locked] = await tx
+        .select({ id: tasks.id })
+        .from(tasks)
+        .where(eq(tasks.id, taskRow.id))
+        .for("update");
+
+      if (!locked) {
+        return { kind: "not_found" as const };
+      }
+
+      // --- Attachment cascade (placeholder) ---------------------------------
+      // When the attachments table + storage driver ship:
+      //   1. SELECT all attachment rows for `tasks.id` inside this tx.
+      //   2. Delete the storage objects (idempotent; ignore "already gone").
+      //   3. tx.delete(attachments).where(eq(attachments.taskId, locked.id)).
+      // Until then there is nothing to clean up — the GET endpoint hard-codes
+      // an empty `attachments` array on the wire, so no client expects any
+      // physical attachments to exist for any task in production.
+      // ----------------------------------------------------------------------
+
+      await tx.delete(tasks).where(eq(tasks.id, locked.id));
+
+      return { kind: "ok" as const };
+    });
+
+    if (result.kind === "not_found") {
+      return errorResponse(404, "NOT_FOUND", "Task not found");
+    }
+
+    // 204 No Content: the resource is gone and there's no representation to
+    // return. Body MUST be empty per the HTTP spec — `new NextResponse(null,
+    // ...)` is the right shape (json() would emit "null" as a body).
+    return new NextResponse(null, { status: 204 });
+  } catch (err: unknown) {
+    console.error("[DELETE /api/tasks/[taskId]] unexpected error", err);
+    return errorResponse(
+      500,
+      "INTERNAL_ERROR",
+      "Unable to delete task at this time",
+    );
+  }
+}
