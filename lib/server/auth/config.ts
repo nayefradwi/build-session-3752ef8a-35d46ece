@@ -10,6 +10,7 @@ import { db } from "@/lib/db";
 import { users } from "@/lib/db/schema";
 import { verifyPassword } from "@/lib/server/auth/password";
 import {
+  AUTH_RATE_LIMIT,
   LOGIN_RATE_LIMIT,
   checkLimit,
   getClientIp,
@@ -87,11 +88,29 @@ export const authConfig: NextAuthConfig = {
         }
         const { email, password } = parsed.data;
 
-        // 2. Brute-force protection. We key on (ip, email) so an attacker
-        //    can't lock another user out by spamming a single email from
-        //    many IPs, and a single IP can't burn through the password
-        //    space across many emails.
+        // 2. Brute-force protection. Two layers, both must pass:
+        //
+        //    a) Per-IP cap: 10 attempts / 15 min, shared with the register
+        //       endpoint's policy (`AUTH_RATE_LIMIT`). Catches credential-
+        //       stuffing across many emails from a single IP.
+        //
+        //    b) Per (ip, email) cap: 5 attempts / 60 s (`LOGIN_RATE_LIMIT`).
+        //       Prevents a single attacker from burning the password space
+        //       on one user, and prevents a victim from being locked out
+        //       by an attacker spamming their email from many IPs (since
+        //       each attacker IP gets its own bucket).
+        //
+        //    The Auth.js Credentials flow turns thrown errors into a
+        //    redirect with `?error=CredentialsSignin&code=rate_limited`;
+        //    we can't set HTTP headers from here, but the broader 429 +
+        //    Retry-After surface is exposed by `POST /api/auth/register`
+        //    where we own the response.
         const ip = getClientIp(request);
+        const ipKey = `auth:${ip}`;
+        const ipLimit = checkLimit(ipKey, AUTH_RATE_LIMIT);
+        if (!ipLimit.ok) {
+          throw new RateLimitedError();
+        }
         const rateKey = `login:${ip}:${email}`;
         const limit = checkLimit(rateKey, LOGIN_RATE_LIMIT);
         if (!limit.ok) {
