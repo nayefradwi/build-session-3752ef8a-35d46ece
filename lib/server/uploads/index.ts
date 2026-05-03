@@ -14,14 +14,18 @@ export {
   uploadBootstrapFailed,
 } from "./storage";
 export {
+  ACCEPTED_DETECTED_MIMES,
   ALLOWED_MIME_TYPES,
+  MAGIC_BYTE_EXEMPT_MIMES,
   MAX_UPLOAD_SIZE_BYTES,
   describeUploadValidationFailure,
   isAllowedMimeType,
   validateUpload,
+  verifyMagicBytes,
 } from "./validation";
 export type {
   AllowedMimeType,
+  MagicByteVerificationResult,
   UploadValidationResult,
   ValidatableUpload,
 } from "./validation";

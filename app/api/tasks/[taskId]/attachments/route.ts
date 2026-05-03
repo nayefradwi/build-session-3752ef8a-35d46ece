@@ -15,6 +15,7 @@ import {
   getUploadDir,
   uploadBootstrapFailed,
   validateUpload,
+  verifyMagicBytes,
 } from "@/lib/server/uploads";
 
 // Force dynamic: every upload pulls the session cookie and writes a brand-new
@@ -29,7 +30,7 @@ type AttachmentErrorCode =
   | "FORBIDDEN"
   | "NOT_FOUND"
   | "PAYLOAD_TOO_LARGE"
-  | "UNSUPPORTED_MEDIA_TYPE"
+  | "INVALID_FILE_TYPE"
   | "LIMIT_REACHED"
   | "INTERNAL_ERROR";
 
@@ -130,7 +131,12 @@ function sanitizeFilename(rawName: string): string {
  *   - File must have a non-empty name and non-zero size (422).
  *   - File must be ≤ 10 MiB (422 LIMIT_REACHED — the task spec maps size
  *     overflow to 422 even though 413 would be the strict-HTTP read).
- *   - MIME type must be in the shared whitelist (415 UNSUPPORTED_MEDIA_TYPE).
+ *   - Declared MIME type must be in the whitelist AND the file's magic bytes
+ *     must match what was declared. Either rejection collapses to 422
+ *     INVALID_FILE_TYPE with body `{ error: "File type not allowed" }`. The
+ *     magic-byte sniff (via the `file-type` package) is the second line of
+ *     defense — multipart `Content-Type` is attacker-supplied, so we don't
+ *     trust it until the bytes prove it.
  *   - Existing attachment count for the task must be < 10 (422 LIMIT_REACHED).
  *
  * Atomicity:
@@ -197,9 +203,12 @@ export async function POST(
   //                            HTTP would prefer 413, but the contract here
   //                            says 422 so the kanban UI can surface size
   //                            and count overflows on the same error code).
-  //   - invalid_type        -> 415 UNSUPPORTED_MEDIA_TYPE (HTTP-spec correct
-  //                            and matches what the validation lib's docs
-  //                            recommend).
+  //   - invalid_type        -> 422 INVALID_FILE_TYPE 'File type not allowed'
+  //                            (the file-type-whitelist task explicitly maps
+  //                            declared-MIME rejections to this status +
+  //                            message; same shape as the magic-byte mismatch
+  //                            below so the kanban UI handles both cases on
+  //                            one branch).
   const validation = validateUpload({
     size: file.size,
     type: file.type,
@@ -230,13 +239,17 @@ export async function POST(
         );
       case "invalid_type":
         return errorResponse(
-          415,
-          "UNSUPPORTED_MEDIA_TYPE",
-          `Unsupported file type: ${validation.mimeType || "unknown"}`,
-          { allowed: validation.allowed },
+          422,
+          "INVALID_FILE_TYPE",
+          "File type not allowed",
+          { mimeType: validation.mimeType, allowed: validation.allowed },
         );
     }
   }
+  // The validated, normalized declared MIME — guaranteed to be in the
+  // whitelist and lower-cased so the magic-byte verifier can map it directly
+  // into the per-MIME accept-set.
+  const declaredMimeType = validation.mimeType;
 
   try {
     // 1. Locate the task and resolve the owning project. Cross-tenant rows
@@ -308,10 +321,47 @@ export async function POST(
     // than streaming for a serverless function with finite memory anyway.
     const bytes = Buffer.from(await file.arrayBuffer());
 
+    // Magic-byte verification: confirm the actual file content matches the
+    // declared MIME type. The multipart `Content-Type` is attacker-supplied —
+    // a renamed `payload.exe` will happily declare `image/png` — so we sniff
+    // the first few KiB with `file-type` and reject any mismatch with the
+    // same 422 'File type not allowed' that a whitelist miss produces. Plain
+    // text formats (text/plain, text/csv) are exempt and skip the sniff
+    // because they have no reliable signature; `verifyMagicBytes` returns
+    // `kind: "exempt"` for those.
+    //
+    // Anything that fails here is logged so we can spot abuse patterns while
+    // still showing the user the same generic message — we don't want to leak
+    // the detected sniffer result back to a malicious caller.
+    const magicCheck = await verifyMagicBytes(bytes, declaredMimeType);
+    if (!magicCheck.ok) {
+      console.warn(
+        "[POST /api/tasks/[taskId]/attachments] magic-byte verification rejected upload",
+        {
+          taskId,
+          userId: session.user.id,
+          declaredMime: declaredMimeType,
+          kind: magicCheck.kind,
+          detectedMime:
+            magicCheck.kind === "mismatch" ? magicCheck.detectedMime : null,
+        },
+      );
+      return errorResponse(
+        422,
+        "INVALID_FILE_TYPE",
+        "File type not allowed",
+        {
+          declaredMime: declaredMimeType,
+          detectedMime:
+            magicCheck.kind === "mismatch" ? magicCheck.detectedMime : null,
+        },
+      );
+    }
+
     // Pin the validated mime type / filename (post-sanitization for storage,
     // but the original-as-trimmed for display) so the values flowing into the
     // tx don't drift if `file.*` getters are accessed again.
-    const storedMimeType = file.type.toLowerCase().trim();
+    const storedMimeType = declaredMimeType;
     const storedFilename = (file.name?.trim() ?? "") || safeName;
     const storedSize = file.size;
 
