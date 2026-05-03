@@ -1,11 +1,13 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   useCallback,
   useEffect,
   useId,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { useSession } from "next-auth/react";
@@ -29,6 +31,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -105,6 +108,7 @@ type TeamSettingsManagerProps = {
  * project rename, danger zone) can slot in without rework.
  */
 export function TeamSettingsManager({ teamId }: TeamSettingsManagerProps) {
+  const router = useRouter();
   const { data: session, status: sessionStatus } = useSession();
   const callerId = session?.user?.id ?? null;
 
@@ -115,6 +119,9 @@ export function TeamSettingsManager({ teamId }: TeamSettingsManagerProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notFound, setNotFound] = useState(false);
+  // Track when we've already kicked off a redirect so a re-render of the
+  // gate effect doesn't fire toast.error twice or queue a second navigation.
+  const redirectedRef = useRef(false);
 
   const loadAll = useCallback(async () => {
     setLoading(true);
@@ -175,6 +182,87 @@ export function TeamSettingsManager({ teamId }: TeamSettingsManagerProps) {
   }, [callerId, members]);
 
   const isTeamAdmin = callerMembership?.role === "admin";
+
+  // Admin-only access: this page mirrors the server-side gate on
+  // `PUT /api/teams/[teamId]` (team admins only — tenant admins do NOT
+  // bypass). We bounce non-admins to the team's members page (which is
+  // accessible to any tenant user) with a one-shot toast explaining why.
+  // The redirect waits until the team + membership lookups have finished so
+  // we don't fire on the first render before `members` is populated.
+  useEffect(() => {
+    if (sessionStatus !== "authenticated") return;
+    if (loading) return;
+    if (!team) return;
+    if (isTeamAdmin) return;
+    if (redirectedRef.current) return;
+    redirectedRef.current = true;
+    toast.error("Team admins only", {
+      description: "Only team admins can access team settings.",
+    });
+    router.replace(`/teams/${teamId}/members`);
+  }, [isTeamAdmin, loading, router, sessionStatus, team, teamId]);
+
+  // Keep the browser tab title in sync with the live team name so a rename
+  // is reflected without a hard reload. Static `metadata.title` on the page
+  // is the static fallback; this overrides it once the team has loaded.
+  useEffect(() => {
+    if (!team) return;
+    if (typeof document === "undefined") return;
+    document.title = `${team.name} · Team settings`;
+  }, [team]);
+
+  /**
+   * PUT the new team name. Trims, validates non-empty, on success updates
+   * the local team state (re-rendering the H1 + browser title), and emits a
+   * sonner success toast. Errors are mapped to friendlier messages for the
+   * common 403 / 404 / 400 cases.
+   */
+  const onRenameTeam = useCallback(
+    async (rawName: string): Promise<{ ok: boolean; error?: string }> => {
+      const name = rawName.trim();
+      if (name.length === 0) {
+        return { ok: false, error: "Team name can't be empty." };
+      }
+      if (!team) {
+        return { ok: false, error: "Team not loaded yet." };
+      }
+      if (name === team.name) {
+        // No-op — nothing to save.
+        return { ok: true };
+      }
+      try {
+        const resp = await apiClient.put<{ team: TeamSummary }>(
+          `/api/teams/${teamId}`,
+          { name },
+          { silent: true, skipAuthRedirect: true },
+        );
+        setTeam(resp.team);
+        toast.success("Team renamed", {
+          description: `Team is now called “${resp.team.name}”.`,
+        });
+        return { ok: true };
+      } catch (err) {
+        if (err instanceof ApiError) {
+          if (err.status === 403) {
+            const msg = "Only team admins can rename the team.";
+            toast.error("Permission denied", { description: msg });
+            return { ok: false, error: msg };
+          }
+          if (err.status === 404) {
+            const msg = "This team no longer exists.";
+            toast.error("Team not found", { description: msg });
+            return { ok: false, error: msg };
+          }
+          toast.error("Couldn't rename team", { description: err.message });
+          return { ok: false, error: err.message };
+        }
+        const fallback = "Something went wrong. Please try again.";
+        toast.error("Couldn't rename team", { description: fallback });
+        return { ok: false, error: fallback };
+      }
+    },
+    [team, teamId],
+  );
 
   const onVisibilityChange = useCallback(
     async (next: ProjectVisibility) => {
@@ -240,6 +328,12 @@ export function TeamSettingsManager({ teamId }: TeamSettingsManagerProps) {
     return <PageErrorState message={error} onRetry={() => void loadAll()} />;
   }
 
+  // Non-admins are redirected by the effect above. Render the loading state
+  // in the interim so they don't briefly see settings controls flash.
+  if (team && !isTeamAdmin) {
+    return <PageLoadingState />;
+  }
+
   return (
     <div className="space-y-8">
       <header className="space-y-3">
@@ -258,12 +352,19 @@ export function TeamSettingsManager({ teamId }: TeamSettingsManagerProps) {
             {team?.name ?? "Team"}
           </h1>
           <p className="text-sm text-muted-foreground">
-            {isTeamAdmin
-              ? "You're a team admin. Settings changes apply to everyone on the team."
-              : "Settings are managed by team admins. You can review the current configuration here."}
+            You&apos;re a team admin. Settings changes apply to everyone on
+            the team.
           </p>
         </div>
       </header>
+
+      {team ? (
+        <TeamNameSection
+          key={team.id}
+          currentName={team.name}
+          onSubmit={onRenameTeam}
+        />
+      ) : null}
 
       <ProjectVisibilitySection
         project={project}
@@ -271,6 +372,148 @@ export function TeamSettingsManager({ teamId }: TeamSettingsManagerProps) {
         onChange={onVisibilityChange}
       />
     </div>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            Team name settings card                         */
+/* -------------------------------------------------------------------------- */
+
+// Mirror of the server-side `updateTeamInputSchema` bounds in
+// `app/api/teams/[teamId]/route.ts` so we surface validation locally rather
+// than waiting on a 400 round-trip. Keep these in sync if the server tweaks.
+const TEAM_NAME_MAX_LENGTH = 120;
+
+type TeamNameSectionProps = {
+  currentName: string;
+  onSubmit: (name: string) => Promise<{ ok: boolean; error?: string }>;
+};
+
+function TeamNameSection({ currentName, onSubmit }: TeamNameSectionProps) {
+  const inputId = useId();
+  const errorId = useId();
+  const [draft, setDraft] = useState(currentName);
+  const [validationError, setValidationError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  // When the parent confirms a successful rename it passes a new
+  // `currentName`; reset the draft so the input reflects the canonical
+  // server value (and dirty-state recomputes against the new baseline).
+  useEffect(() => {
+    setDraft(currentName);
+    setValidationError(null);
+  }, [currentName]);
+
+  const trimmed = draft.trim();
+  const isEmpty = trimmed.length === 0;
+  const isDirty = trimmed !== currentName.trim();
+  const isTooLong = trimmed.length > TEAM_NAME_MAX_LENGTH;
+  const canSubmit = !submitting && isDirty && !isEmpty && !isTooLong;
+
+  const handleSubmit = useCallback(
+    async (e: React.FormEvent<HTMLFormElement>) => {
+      e.preventDefault();
+      if (isEmpty) {
+        setValidationError("Team name can't be empty.");
+        return;
+      }
+      if (isTooLong) {
+        setValidationError(
+          `Team name must be ${TEAM_NAME_MAX_LENGTH} characters or fewer.`,
+        );
+        return;
+      }
+      setValidationError(null);
+      setSubmitting(true);
+      try {
+        const result = await onSubmit(trimmed);
+        if (!result.ok && result.error) {
+          setValidationError(result.error);
+        }
+      } finally {
+        setSubmitting(false);
+      }
+    },
+    [isEmpty, isTooLong, onSubmit, trimmed],
+  );
+
+  const handleReset = useCallback(() => {
+    setDraft(currentName);
+    setValidationError(null);
+  }, [currentName]);
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-lg">Team name</CardTitle>
+        <CardDescription>
+          The team name appears across the workspace — in the team
+          directory, board headers, and member rosters.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form onSubmit={handleSubmit} className="space-y-4" noValidate>
+          <div className="space-y-2">
+            <Label htmlFor={inputId}>Team name</Label>
+            <Input
+              id={inputId}
+              name="name"
+              type="text"
+              autoComplete="off"
+              maxLength={TEAM_NAME_MAX_LENGTH}
+              value={draft}
+              onChange={(e) => {
+                setDraft(e.target.value);
+                if (validationError) setValidationError(null);
+              }}
+              disabled={submitting}
+              aria-invalid={validationError ? true : undefined}
+              aria-describedby={validationError ? errorId : undefined}
+              required
+              className="max-w-sm"
+            />
+            {validationError ? (
+              <p
+                id={errorId}
+                role="alert"
+                className="flex items-center gap-1.5 text-xs text-destructive"
+              >
+                <AlertCircle className="h-3.5 w-3.5" aria-hidden="true" />
+                {validationError}
+              </p>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                Up to {TEAM_NAME_MAX_LENGTH} characters.
+              </p>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <Button type="submit" disabled={!canSubmit}>
+              {submitting ? (
+                <>
+                  <Loader2
+                    className="h-4 w-4 animate-spin"
+                    aria-hidden="true"
+                  />
+                  Saving…
+                </>
+              ) : (
+                "Save changes"
+              )}
+            </Button>
+            {isDirty && !submitting ? (
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={handleReset}
+              >
+                Cancel
+              </Button>
+            ) : null}
+          </div>
+        </form>
+      </CardContent>
+    </Card>
   );
 }
 
