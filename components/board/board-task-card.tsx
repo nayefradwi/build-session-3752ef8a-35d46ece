@@ -1,6 +1,7 @@
 "use client";
 
 import type { CSSProperties, HTMLAttributes, Ref } from "react";
+import { Paperclip } from "lucide-react";
 
 import { cn } from "@/lib/client/utils";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -25,6 +26,50 @@ const initialsFromAssignee = (assignee: BoardTaskAssignee): string => {
   const parts = source.split(/\s+/).filter(Boolean);
   if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+};
+
+/**
+ * Deterministic colour palette for the assignee avatar's coloured-circle
+ * fallback. Each entry pairs a Tailwind background with a foreground that
+ * keeps the two-letter initials legible against it. We pick from this list
+ * by hashing the assignee's id so the same person reads as the same colour
+ * across every card on the board (and across re-renders).
+ *
+ * The palette is tuned to read clearly in both light and dark mode — the
+ * 500-weight chroma family on Tailwind's defaults gives enough contrast
+ * against white text without leaning into accent-clash with the board
+ * chrome (which is mostly muted greys). Eight slots are enough variety
+ * for a small team without producing two-similar-shades adjacency.
+ */
+const AVATAR_PALETTE: readonly string[] = [
+  "bg-rose-500 text-white",
+  "bg-orange-500 text-white",
+  "bg-amber-500 text-black",
+  "bg-emerald-500 text-white",
+  "bg-teal-500 text-white",
+  "bg-sky-500 text-white",
+  "bg-indigo-500 text-white",
+  "bg-fuchsia-500 text-white",
+] as const;
+
+/**
+ * Stable colour assignment for a given assignee id. We use a tiny
+ * deterministic string hash (djb2-like) rather than a crypto digest because
+ * the only requirement is "same id → same slot every render", and a 32-bit
+ * accumulator over a UUID gives plenty of distribution across an 8-entry
+ * palette for any realistic team size.
+ *
+ * Falls back to the first palette slot when the id is empty (defensive —
+ * the API guarantees a UUID).
+ */
+const colorClassForAssignee = (assignee: BoardTaskAssignee): string => {
+  const key = assignee.id || assignee.email || "";
+  if (!key) return AVATAR_PALETTE[0];
+  let hash = 0;
+  for (let i = 0; i < key.length; i++) {
+    hash = (hash * 31 + key.charCodeAt(i)) | 0;
+  }
+  return AVATAR_PALETTE[Math.abs(hash) % AVATAR_PALETTE.length];
 };
 
 /* -------------------------------------------------------------------------- */
@@ -55,10 +100,25 @@ type BoardTaskCardProps = {
    */
   onSelect?: (task: BoardTask) => void;
   /**
-   * Drag-handle props from `useSortable`. When provided AND `onSelect` is
-   * also provided, the inner `<button>` doubles as the drag activator. We
-   * keep this off the non-interactive path on purpose — skeleton cards
-   * shouldn't accidentally start a drag.
+   * Force the card into a non-interactive surface regardless of whether
+   * `onSelect` is supplied. Mirrors the read-only mode the kanban surface
+   * uses for non-members and locked-down boards: the click handler is
+   * ignored, the focus ring + cursor-pointer affordance fall away, and the
+   * card renders as a plain {@link Card} so nothing reads as actionable.
+   *
+   * Note: `onSelect` being undefined already produces a non-interactive
+   * card (the DragOverlay clone path uses this). `readOnly` is the explicit
+   * counterpart — useful when the parent always wires a handler but wants
+   * to disable activation in a particular context (e.g. a preview / archive
+   * surface where opening the detail modal isn't meaningful).
+   */
+  readOnly?: boolean;
+  /**
+   * Drag-handle props from `useSortable`. When provided AND the card is in
+   * its interactive mode (`onSelect` set, `readOnly` false), the inner
+   * `<button>` doubles as the drag activator. We keep this off the non-
+   * interactive path on purpose — skeleton / read-only cards shouldn't
+   * accidentally start a drag.
    */
   dragHandleProps?: BoardTaskDragHandleProps;
   /**
@@ -78,28 +138,36 @@ type BoardTaskCardProps = {
  *   - Title is the primary affordance — clamped to two lines so a runaway
  *     title can't blow up the lane height.
  *   - Description (if present) renders as a one-line preview, also clamped.
- *   - Assignee, if present, renders as a small avatar (initials only — the
- *     users table only stores an `image` URL on the profile, but the tasks
- *     endpoint does not currently include it on the inlined slice). The
- *     avatar carries the full name/email as a tooltip via `title` so a hover
- *     surfaces the full identity without needing a popover.
+ *   - Assignee, if present, renders as a small avatar with initials inside
+ *     a deterministically-coloured circle (so the same person reads as the
+ *     same colour everywhere on the board). The avatar carries the full
+ *     name/email as a `title` tooltip and an `aria-label` so a hover or
+ *     screen reader still surfaces the full identity.
+ *   - Attachment count, if known and > 0, renders as a small paperclip
+ *     badge to the left of the assignee. Hidden when the count is zero or
+ *     when the field isn't supplied (the bulk board endpoint doesn't yet
+ *     surface attachment counts; the badge will start appearing the moment
+ *     it does, with no further wiring required here).
  *
  * Interaction:
- *   - When `onSelect` is provided the entire card is a `role="button"`
- *     element (we use a real `<button>` so Enter/Space activation comes for
- *     free), and clicking/keyboard-activating the card hands the task back
- *     to the parent — typically to open the task-detail modal.
- *   - When `onSelect` is omitted the card stays a plain `<div>` so callsites
- *     that render skeleton/preview cards don't get the focus ring.
+ *   - When `onSelect` is provided AND `readOnly` is false the entire card
+ *     is a `<button>` (Enter/Space activation, focus ring, etc. are all
+ *     platform-native), and clicking/keyboard-activating the card hands the
+ *     task back to the parent — typically to open the task-detail modal.
+ *   - When `onSelect` is omitted OR `readOnly` is true the card stays a
+ *     plain, non-interactive surface — used by the skeleton path, the drag
+ *     overlay clone, and read-only contexts where opening the detail modal
+ *     isn't meaningful.
  */
 export function BoardTaskCard({
   task,
   onSelect,
+  readOnly = false,
   dragHandleProps,
   isDragging = false,
   style,
 }: BoardTaskCardProps) {
-  const interactive = typeof onSelect === "function";
+  const interactive = !readOnly && typeof onSelect === "function";
   const cardClassName = cn(
     "block w-full space-y-2 rounded-md border bg-background p-3 text-left shadow-sm transition-colors",
     "hover:border-foreground/30 hover:shadow-md",
@@ -110,6 +178,15 @@ export function BoardTaskCard({
     // doesn't reflow as the DragOverlay clone moves with the cursor.
     isDragging && "opacity-40 border-dashed shadow-none",
   );
+
+  // Whether to surface an attachment-count badge. We treat unknown
+  // (`undefined`) and zero the same way: nothing renders. Negative values
+  // are also defensively excluded — the count is a non-negative integer at
+  // the source of truth, but a stale serialiser could in theory produce a
+  // bogus value and we'd rather omit the badge than render "-1".
+  const attachmentCount = task.attachmentCount;
+  const showAttachmentBadge =
+    typeof attachmentCount === "number" && attachmentCount > 0;
 
   const inner = (
     <>
@@ -123,7 +200,15 @@ export function BoardTaskCard({
         </p>
       ) : null}
 
-      <div className="flex items-center justify-end pt-1">
+      <div className="flex items-center justify-between gap-2 pt-1">
+        {/* Leading slot: attachment-count badge when > 0, otherwise an
+            empty spacer so the trailing assignee block stays right-aligned
+            without needing two layout branches. */}
+        {showAttachmentBadge ? (
+          <AttachmentBadge count={attachmentCount as number} />
+        ) : (
+          <span aria-hidden="true" />
+        )}
         {task.assignee ? (
           <AssigneeAvatar assignee={task.assignee} />
         ) : (
@@ -182,6 +267,7 @@ export function BoardTaskCard({
 function AssigneeAvatar({ assignee }: { assignee: BoardTaskAssignee }) {
   const label = assignee.name ?? assignee.email;
   const initials = initialsFromAssignee(assignee);
+  const colorClass = colorClassForAssignee(assignee);
 
   return (
     <Avatar
@@ -191,7 +277,41 @@ function AssigneeAvatar({ assignee }: { assignee: BoardTaskAssignee }) {
       title={label}
       aria-label={`Assigned to ${label}`}
     >
-      <AvatarFallback className="text-[10px]">{initials}</AvatarFallback>
+      <AvatarFallback className={cn("text-[10px] font-semibold", colorClass)}>
+        {initials}
+      </AvatarFallback>
     </Avatar>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                          Attachment count badge                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Compact "N attachments" pill rendered on the leading edge of the card's
+ * metadata row. The paperclip icon is the universal attachment glyph (it
+ * mirrors the icon used in the task-detail modal's Attachments section),
+ * paired with the numeric count so a glance both flags "this card has
+ * files" and tells you how many.
+ *
+ * Plural-aware aria-label: "1 attachment" vs "N attachments". The visible
+ * pill stays terse so it doesn't crowd the assignee avatar on a narrow
+ * lane, but screen readers still get the full phrase.
+ */
+function AttachmentBadge({ count }: { count: number }) {
+  const label = count === 1 ? "1 attachment" : `${count} attachments`;
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 rounded-full border bg-muted/60 px-2 py-0.5",
+        "text-[11px] font-medium text-muted-foreground",
+      )}
+      aria-label={label}
+      title={label}
+    >
+      <Paperclip className="h-3 w-3" aria-hidden="true" />
+      <span>{count}</span>
+    </span>
   );
 }

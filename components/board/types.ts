@@ -24,6 +24,15 @@ export type BoardTask = {
   description: string | null;
   position: number;
   assignee: BoardTaskAssignee | null;
+  /**
+   * Number of attachments persisted against this task. Optional because the
+   * board's bulk `GET /api/projects/[projectId]/tasks` endpoint does not yet
+   * surface this count — when present it drives the paperclip badge on the
+   * task card; when undefined the card simply omits the badge. Wiring up the
+   * server-side count is a backend follow-up; the field exists here so the
+   * card can render the affordance the moment the count starts arriving.
+   */
+  attachmentCount?: number;
 };
 
 /** A column with its tasks pre-grouped in render order. */
